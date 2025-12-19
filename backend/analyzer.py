@@ -71,14 +71,13 @@ class DanceAnalyzer:
             y, sr = librosa.load(temp_path)
             onset_env = librosa.onset.onset_strength(y=y, sr=sr)
             tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
-
-            # Simple rhythm consistency check (variance in onset strength)
-            rhythm_consistency = float(np.std(onset_env))
+            duration = librosa.get_duration(y=y, sr=sr)
 
             audio_data = {
                 "tempo": float(tempo),
-                "rhythm_consistency": rhythm_consistency,
-                "duration": librosa.get_duration(y=y, sr=sr)
+                "onset_env": onset_env.tolist()[::10], # Downsample for transmission
+                "duration": duration,
+                "sr": sr
             }
         except Exception as e:
             print(f"Audio analysis failed: {e}")
@@ -91,20 +90,73 @@ class DanceAnalyzer:
         os.remove(temp_path)
         os.rmdir(temp_dir)
 
+        metrics = self.calculate_metrics(pose_data, audio_data)
+
         return {
             "pose_data": pose_data,
             "audio_data": audio_data,
-            "metrics": self.calculate_metrics(pose_data, audio_data)
+            "metrics": metrics
         }
 
     def calculate_metrics(self, pose_data, audio_data):
-        # Placeholder for complex metrics
-        # "腰の据わり" (Stability of hips - landmarks 23, 24)
-        # "リズム調和度" (Correlation between movement and beat)
-        # "序破急" (Dynamic changes in velocity)
+        if not pose_data:
+            return {}
+
+        # 1. Koshi (MidHip Stability)
+        # MidHip is roughly average of Left Hip (23) and Right Hip (24)
+        mid_hip_y_variances = []
+        for frame in pose_data:
+            landmarks = frame.get("landmarks", [])
+            if len(landmarks) > 24:
+                left_hip = landmarks[23]
+                right_hip = landmarks[24]
+                mid_hip_y = (left_hip['y'] + right_hip['y']) / 2
+                mid_hip_y_variances.append(mid_hip_y)
+
+        stability_score = 0.0
+        if mid_hip_y_variances:
+            # Lower variance means higher stability. Normalize.
+            variance = np.var(mid_hip_y_variances)
+            stability_score = max(0, 1.0 - (variance * 10)) # Heuristic scaling
+
+        # 2. Kire (Jerk of Hands)
+        # Calculate jerk (derivative of acceleration) for hands (15, 16)
+        hand_velocities = []
+        # Simplified: average movement of wrists per frame
+        for i in range(1, len(pose_data)):
+            curr = pose_data[i]["landmarks"]
+            prev = pose_data[i-1]["landmarks"]
+            if len(curr) > 16 and len(prev) > 16:
+                # Left wrist (15) dist
+                d_left = np.sqrt((curr[15]['x']-prev[15]['x'])**2 + (curr[15]['y']-prev[15]['y'])**2)
+                # Right wrist (16) dist
+                d_right = np.sqrt((curr[16]['x']-prev[16]['x'])**2 + (curr[16]['y']-prev[16]['y'])**2)
+                hand_velocities.append((d_left + d_right) / 2)
+
+        dynamism_score = 0.0
+        if hand_velocities:
+            # Kire implies ability to stop quickly (high deceleration) or move fast
+            # We use max velocity / average velocity as a proxy for "dynamic range" of movement
+            avg_vel = np.mean(hand_velocities)
+            max_vel = np.max(hand_velocities)
+            if avg_vel > 0:
+                dynamism_score = min(1.0, (max_vel / avg_vel) / 5.0) # Heuristic
+
+        # 3. Ma (Rhythm Harmony / Pause)
+        # Check if stops in movement correlate with audio onsets
+        rhythm_score = 0.5 # Default
+
+        # Simple heuristic: "Ma" score based on ratio of low-movement frames (pauses)
+        if hand_velocities:
+            threshold = np.mean(hand_velocities) * 0.2
+            pause_frames = sum(1 for v in hand_velocities if v < threshold)
+            pause_ratio = pause_frames / len(hand_velocities)
+            # Ideal "Ma" might be around 10-20% pause?
+            rhythm_score = 1.0 - abs(pause_ratio - 0.15) * 2
+            rhythm_score = max(0, min(1.0, rhythm_score))
 
         return {
-            "stability_score": 0.85, # Mock score
-            "rhythm_score": 0.92,    # Mock score
-            "dynamism_score": 0.78   # Mock score
+            "stability_score": float(stability_score),
+            "rhythm_score": float(rhythm_score),
+            "dynamism_score": float(dynamism_score)
         }
