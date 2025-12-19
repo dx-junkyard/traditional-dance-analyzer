@@ -24,7 +24,7 @@ function LoginContent() {
                 console.log("Login success:", response.data);
                 // Save token (localStorage/cookie) - Mocking
                 localStorage.setItem('token', response.data.token);
-                router.push('/dashboard');
+                router.push('/');
             }).catch(err => {
                 console.error("Login failed:", err);
             });
