@@ -63,12 +63,7 @@ def calculate_color_histogram(image):
 class DanceAnalyzer:
     def __init__(self):
         self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=2,
-            enable_segmentation=True,
-            min_detection_confidence=0.5
-        )
+        # self.pose removed to prevent state leak across sessions
 
         # Check for TFLite model, use relative path or download
         model_path = os.path.join(os.getcwd(), 'efficientdet_lite0.tflite')
@@ -111,10 +106,6 @@ class DanceAnalyzer:
                 h, w, _ = frame.shape
                 valid_detections = []
                 for i, detection in enumerate(results.detections):
-                    # For efficientdet_lite0, class 'person' usually has index 0 if labeled,
-                    # but detection.categories[0].category_name should be checked.
-                    # Or we just accept all objects (usually people in dance videos) or filter by 'person'.
-
                     category = detection.categories[0]
                     if category.category_name != 'person':
                         continue
@@ -153,193 +144,201 @@ class DanceAnalyzer:
         start_time = time.time()
 
         # 1. Pose Analysis with MediaPipe
-        cap = cv2.VideoCapture(file_path)
-        if not cap.isOpened():
-             yield {"status": "error", "progress": 0, "message": "Could not open video file"}
-             return
+        # Initialize Pose here with context manager
+        with self.mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=2,
+            enable_segmentation=True,
+            min_detection_confidence=0.5
+        ) as pose:
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap = cv2.VideoCapture(file_path)
+            if not cap.isOpened():
+                 yield {"status": "error", "progress": 0, "message": "Could not open video file"}
+                 return
 
-        pose_data = []
-        frames_processed = 0
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        logger.info(f"Video info: FPS={fps}, Frames={frame_count}")
-        yield {"status": "processing_video", "progress": 0, "message": f"Starting video processing ({frame_count} frames)..."}
+            pose_data = []
+            frames_processed = 0
 
-        # Tracking State
-        target_hist = None
-        last_bbox = None # [x, y, w, h] normalized
+            logger.info(f"Video info: FPS={fps}, Frames={frame_count}")
+            yield {"status": "processing_video", "progress": 0, "message": f"Starting video processing ({frame_count} frames)..."}
 
-        if tracking_config and "target_bbox" in tracking_config:
-            last_bbox = tracking_config["target_bbox"]
-            # Convert dict/list if needed. Assuming list [x, y, w, h]
-            if isinstance(last_bbox, dict):
-                last_bbox = [last_bbox['x'], last_bbox['y'], last_bbox['width'], last_bbox['height']]
+            # Tracking State
+            target_hist = None
+            last_bbox = None # [x, y, w, h] normalized
 
-        pose_start = time.time()
+            if tracking_config and "target_bbox" in tracking_config:
+                last_bbox = tracking_config["target_bbox"]
+                # Convert dict/list if needed. Assuming list [x, y, w, h]
+                if isinstance(last_bbox, dict):
+                    last_bbox = [last_bbox['x'], last_bbox['y'], last_bbox['width'], last_bbox['height']]
 
-        # We need to initialize the histogram on the first frame where target is visible
-        # If we have an initial bbox, we use it on frame 0 (or first frame read).
-        histogram_initialized = False
+            pose_start = time.time()
 
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+            # We need to initialize the histogram on the first frame where target is visible
+            # If we have an initial bbox, we use it on frame 0 (or first frame read).
+            histogram_initialized = False
 
-            h, w, _ = frame.shape
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            # --- Tracking Logic ---
-            current_roi_image = image # Default to full image
-            roi_offset_x = 0
-            roi_offset_y = 0
+                h, w, _ = frame.shape
+                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
 
-            # If we have a target to track
-            if last_bbox:
-                # 1. Initialize Histogram if needed
-                if not histogram_initialized:
-                    # Crop to last_bbox
-                    lx, ly, lw, lh = last_bbox
-                    px, py = int(lx * w), int(ly * h)
-                    pw, ph = int(lw * w), int(lh * h)
+                # --- Tracking Logic ---
+                current_roi_image = image # Default to full image
+                roi_offset_x = 0
+                roi_offset_y = 0
 
-                    # Ensure within bounds
-                    px = max(0, px); py = max(0, py)
-                    pw = min(w - px, pw); ph = min(h - py, ph)
+                # If we have a target to track
+                if last_bbox:
+                    # 1. Initialize Histogram if needed
+                    if not histogram_initialized:
+                        # Crop to last_bbox
+                        lx, ly, lw, lh = last_bbox
+                        px, py = int(lx * w), int(ly * h)
+                        pw, ph = int(lw * w), int(lh * h)
 
-                    if pw > 0 and ph > 0:
-                        roi = image[py:py+ph, px:px+pw]
-                        pose_results = self.pose.process(roi)
-                        if pose_results.pose_landmarks:
-                            torso_roi = extract_torso_roi(roi, pose_results.pose_landmarks.landmark)
-                            if torso_roi is not None:
-                                target_hist = calculate_color_histogram(torso_roi)
-                                histogram_initialized = True
-
-                        # Fallback
-                        if not histogram_initialized:
-                            target_hist = calculate_color_histogram(roi)
-                            histogram_initialized = True
-
-                # 2. Track in current frame
-                # Detect all candidates
-                det_results = self.detector.detect(mp_image)
-                best_bbox = None
-                best_score = -1
-
-                if det_results.detections and histogram_initialized:
-                    for detection in det_results.detections:
-                        # Check category
-                        if detection.categories[0].category_name != 'person':
-                            continue
-
-                        bboxC = detection.bounding_box
-                        # Convert to normalized
-                        cx_norm, cy_norm = bboxC.origin_x / w, bboxC.origin_y / h
-                        cw_norm, ch_norm = bboxC.width / w, bboxC.height / h
-
-                        # Score 1: Spatial (IOU or Distance) - using Distance between centers
-                        # Last center
-                        lcx = last_bbox[0] + last_bbox[2]/2
-                        lcy = last_bbox[1] + last_bbox[3]/2
-                        # Current center
-                        ccx = cx_norm + cw_norm/2
-                        ccy = cy_norm + ch_norm/2
-
-                        dist = np.sqrt((lcx - ccx)**2 + (lcy - ccy)**2)
-                        score_dist = max(0, 1.0 - dist * 2) # Penalize distance heavily
-
-                        # Score 2: Visual (Histogram)
-                        # Extract ROI for candidate
-                        px, py = int(cx_norm * w), int(cy_norm * h)
-                        pw, ph = int(cw_norm * w), int(ch_norm * h)
+                        # Ensure within bounds
                         px = max(0, px); py = max(0, py)
                         pw = min(w - px, pw); ph = min(h - py, ph)
 
-                        score_hist = 0
                         if pw > 0 and ph > 0:
-                            cand_roi = image[py:py+ph, px:px+pw]
-                            cand_hist = calculate_color_histogram(cand_roi)
-                            # Compare
-                            score_hist = cv2.compareHist(target_hist, cand_hist, cv2.HISTCMP_CORREL)
+                            roi = image[py:py+ph, px:px+pw]
+                            # Use 'pose' instance here
+                            pose_results = pose.process(roi)
+                            if pose_results.pose_landmarks:
+                                torso_roi = extract_torso_roi(roi, pose_results.pose_landmarks.landmark)
+                                if torso_roi is not None:
+                                    target_hist = calculate_color_histogram(torso_roi)
+                                    histogram_initialized = True
 
-                        # Combined Score
-                        total_score = 0.6 * score_dist + 0.4 * score_hist
+                            # Fallback
+                            if not histogram_initialized:
+                                target_hist = calculate_color_histogram(roi)
+                                histogram_initialized = True
 
-                        if total_score > best_score:
-                            best_score = total_score
-                            best_bbox = [cx_norm, cy_norm, cw_norm, ch_norm]
+                    # 2. Track in current frame
+                    # Detect all candidates
+                    det_results = self.detector.detect(mp_image)
+                    best_bbox = None
+                    best_score = -1
 
-                # Update tracking state
-                if best_bbox:
-                    last_bbox = best_bbox
-                    # Prepare ROI for Pose Analysis
-                    lx, ly, lw, lh = last_bbox
-                    px, py = int(lx * w), int(ly * h)
-                    pw, ph = int(lw * w), int(lh * h)
+                    if det_results.detections and histogram_initialized:
+                        for detection in det_results.detections:
+                            # Check category
+                            if detection.categories[0].category_name != 'person':
+                                continue
 
-                    # Add padding for Pose stability
-                    pad_x = int(pw * 0.2)
-                    pad_y = int(ph * 0.2)
-                    px_pad = max(0, px - pad_x)
-                    py_pad = max(0, py - pad_y)
-                    pw_pad = min(w - px_pad, pw + 2 * pad_x)
-                    ph_pad = min(h - py_pad, ph + 2 * pad_y)
+                            bboxC = detection.bounding_box
+                            # Convert to normalized
+                            cx_norm, cy_norm = bboxC.origin_x / w, bboxC.origin_y / h
+                            cw_norm, ch_norm = bboxC.width / w, bboxC.height / h
 
-                    if pw_pad > 0 and ph_pad > 0:
-                        current_roi_image = image[py_pad:py_pad+ph_pad, px_pad:px_pad+pw_pad]
-                        roi_offset_x = px_pad
-                        roi_offset_y = py_pad
-                else:
-                    # Keep previous bbox as best guess, but maybe expand search next time?
-                    pass
+                            # Score 1: Spatial (IOU or Distance) - using Distance between centers
+                            # Last center
+                            lcx = last_bbox[0] + last_bbox[2]/2
+                            lcy = last_bbox[1] + last_bbox[3]/2
+                            # Current center
+                            ccx = cx_norm + cw_norm/2
+                            ccy = cy_norm + ch_norm/2
 
-            # --- End Tracking Logic ---
+                            dist = np.sqrt((lcx - ccx)**2 + (lcy - ccy)**2)
+                            score_dist = max(0, 1.0 - dist * 2) # Penalize distance heavily
 
-            # Run Pose on the selected ROI
-            results = self.pose.process(current_roi_image)
+                            # Score 2: Visual (Histogram)
+                            # Extract ROI for candidate
+                            px, py = int(cx_norm * w), int(cy_norm * h)
+                            pw, ph = int(cw_norm * w), int(ch_norm * h)
+                            px = max(0, px); py = max(0, py)
+                            pw = min(w - px, pw); ph = min(h - py, ph)
 
-            frame_data = {
-                "frame": frames_processed,
-                "timestamp": frames_processed / fps if fps else 0,
-                "landmarks": []
-            }
+                            score_hist = 0
+                            if pw > 0 and ph > 0:
+                                cand_roi = image[py:py+ph, px:px+pw]
+                                cand_hist = calculate_color_histogram(cand_roi)
+                                # Compare
+                                score_hist = cv2.compareHist(target_hist, cand_hist, cv2.HISTCMP_CORREL)
 
-            if results.pose_landmarks:
-                for lm in results.pose_landmarks.landmark:
-                    # Adjust landmarks back to global coordinates if we cropped
-                    if roi_offset_x > 0 or roi_offset_y > 0:
-                        # lm.x is relative to crop width
-                        global_x = (lm.x * current_roi_image.shape[1] + roi_offset_x) / w
-                        global_y = (lm.y * current_roi_image.shape[0] + roi_offset_y) / h
+                            # Combined Score
+                            total_score = 0.6 * score_dist + 0.4 * score_hist
+
+                            if total_score > best_score:
+                                best_score = total_score
+                                best_bbox = [cx_norm, cy_norm, cw_norm, ch_norm]
+
+                    # Update tracking state
+                    if best_bbox:
+                        last_bbox = best_bbox
+                        # Prepare ROI for Pose Analysis
+                        lx, ly, lw, lh = last_bbox
+                        px, py = int(lx * w), int(ly * h)
+                        pw, ph = int(lw * w), int(lh * h)
+
+                        # Add padding for Pose stability
+                        pad_x = int(pw * 0.2)
+                        pad_y = int(ph * 0.2)
+                        px_pad = max(0, px - pad_x)
+                        py_pad = max(0, py - pad_y)
+                        pw_pad = min(w - px_pad, pw + 2 * pad_x)
+                        ph_pad = min(h - py_pad, ph + 2 * pad_y)
+
+                        if pw_pad > 0 and ph_pad > 0:
+                            current_roi_image = image[py_pad:py_pad+ph_pad, px_pad:px_pad+pw_pad]
+                            roi_offset_x = px_pad
+                            roi_offset_y = py_pad
                     else:
-                        global_x = lm.x
-                        global_y = lm.y
+                        pass
 
-                    frame_data["landmarks"].append({
-                        "x": global_x,
-                        "y": global_y,
-                        "z": lm.z,
-                        "visibility": lm.visibility
-                    })
+                # --- End Tracking Logic ---
 
-            pose_data.append(frame_data)
-            frames_processed += 1
+                # Run Pose on the selected ROI using 'pose' instance
+                results = pose.process(current_roi_image)
 
-            if frames_processed % 10 == 0 or frames_processed == frame_count:
-                progress = (frames_processed / max(frame_count, 1)) * 0.7
-                yield {
-                    "status": "processing_video",
-                    "progress": round(progress, 3),
-                    "message": f"Processing video frame {frames_processed}/{frame_count}"
+                frame_data = {
+                    "frame": frames_processed,
+                    "timestamp": frames_processed / fps if fps else 0,
+                    "landmarks": []
                 }
 
-        cap.release()
-        pose_end = time.time()
-        logger.info(f"Pose analysis took {pose_end - pose_start:.2f}s")
+                if results.pose_landmarks:
+                    for lm in results.pose_landmarks.landmark:
+                        # Adjust landmarks back to global coordinates if we cropped
+                        if roi_offset_x > 0 or roi_offset_y > 0:
+                            # lm.x is relative to crop width
+                            global_x = (lm.x * current_roi_image.shape[1] + roi_offset_x) / w
+                            global_y = (lm.y * current_roi_image.shape[0] + roi_offset_y) / h
+                        else:
+                            global_x = lm.x
+                            global_y = lm.y
+
+                        frame_data["landmarks"].append({
+                            "x": global_x,
+                            "y": global_y,
+                            "z": lm.z,
+                            "visibility": lm.visibility
+                        })
+
+                pose_data.append(frame_data)
+                frames_processed += 1
+
+                if frames_processed % 10 == 0 or frames_processed == frame_count:
+                    progress = (frames_processed / max(frame_count, 1)) * 0.7
+                    yield {
+                        "status": "processing_video",
+                        "progress": round(progress, 3),
+                        "message": f"Processing video frame {frames_processed}/{frame_count}"
+                    }
+
+            cap.release()
+            pose_end = time.time()
+            logger.info(f"Pose analysis took {pose_end - pose_start:.2f}s")
 
         # 2. Audio Analysis with Librosa
         yield {"status": "processing_audio", "progress": 0.7, "message": "Analyzing audio..."}
