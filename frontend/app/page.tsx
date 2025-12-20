@@ -3,7 +3,6 @@ import React, { useState, useEffect } from 'react';
 import { VideoAnalyzer } from '@/components/VideoAnalyzer';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { Upload, Activity, Zap, LogIn } from 'lucide-react';
-import axios from 'axios';
 import { useRouter } from 'next/navigation';
 
 export default function HomePage() {
@@ -13,6 +12,7 @@ export default function HomePage() {
     const [analysisResult, setAnalysisResult] = useState<any>(null);
     const [loading, setLoading] = useState(false);
     const [progress, setProgress] = useState(0);
+    const [statusMessage, setStatusMessage] = useState("");
     const [videoUrl, setVideoUrl] = useState<string | null>(null);
 
     useEffect(() => {
@@ -44,35 +44,76 @@ export default function HomePage() {
     };
 
     const handleUpload = async () => {
-        if (!file) return;
+        console.log("Upload started");
+        if (!file) {
+            console.log("No file selected");
+            return;
+        }
 
         setLoading(true);
         setProgress(0);
+        setStatusMessage("Starting upload...");
+        setAnalysisResult(null);
 
         const formData = new FormData();
         formData.append('file', file);
 
         try {
-            // Start listening for status
-            const eventSource = new EventSource(`http://localhost:8000/api/v1/status/${file.name}`);
-            eventSource.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                setProgress(Math.round(data.progress * 100));
-                if (data.progress >= 1.0) {
-                    eventSource.close();
-                }
-            };
-
-            const response = await axios.post('http://localhost:8000/api/v1/analyze', formData, {
-                headers: {
-                    'Content-Type': 'multipart/form-data',
-                },
+            console.log("Sending fetch request");
+            const response = await fetch('http://localhost:8000/api/v1/analyze-stream', {
+                method: 'POST',
+                body: formData,
             });
 
-            setAnalysisResult(response.data);
-        } catch (error) {
+            console.log("Fetch response received", response.status);
+
+            if (!response.body) {
+                throw new Error("No response body");
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+
+                // Process all complete lines
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    try {
+                        const data = JSON.parse(line);
+
+                        if (data.status === 'complete' && data.result) {
+                            setAnalysisResult(data.result);
+                            setStatusMessage("Analysis complete!");
+                            setProgress(100);
+                        } else if (data.status === 'error') {
+                            setStatusMessage(`Error: ${data.message}`);
+                            // Stop processing if error
+                            break;
+                        } else {
+                            if (data.progress !== undefined) {
+                                setProgress(Math.round(data.progress * 100));
+                            }
+                            if (data.message) {
+                                setStatusMessage(data.message);
+                            }
+                        }
+                    } catch (e) {
+                        console.error("Failed to parse JSON:", line, e);
+                    }
+                }
+            }
+        } catch (error: any) {
             console.error("Analysis failed", error);
-            // In a real app, handle error UI here
+            setStatusMessage(`Analysis failed: ${error.message || "Unknown error"}`);
         } finally {
             setLoading(false);
         }
@@ -170,12 +211,24 @@ export default function HomePage() {
                                     className="w-full sm:w-auto flex items-center justify-center gap-2 bg-[#0F172A] text-white px-8 py-2.5 rounded-full hover:bg-[#1E293B] disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-medium shadow-md"
                                 >
                                     <Activity size={18} />
-                                    {loading ? `Analyzing ${progress}%` : 'Analyze'}
+                                    {loading ? 'Analyzing...' : 'Analyze'}
                                 </button>
                             </div>
-                            {loading && (
-                                <div className="w-full bg-gray-200 rounded-full h-1.5 mt-4 overflow-hidden">
-                                    <div className="bg-[#0F172A] h-full transition-all duration-300 ease-out" style={{ width: `${progress}%` }}></div>
+                            {/* Progress Bar & Status - Show status if loading OR if there is a message */}
+                            {(loading || statusMessage) && (
+                                <div className="mt-6 space-y-2">
+                                    <div className="flex justify-between text-sm font-medium text-gray-600">
+                                        <span>{statusMessage}</span>
+                                        {loading && <span>{progress}%</span>}
+                                    </div>
+                                    {loading && (
+                                        <div className="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+                                            <div
+                                                className="bg-[#0F172A] h-full transition-all duration-300 ease-out"
+                                                style={{ width: `${progress}%` }}
+                                            ></div>
+                                        </div>
+                                    )}
                                 </div>
                             )}
                         </div>
