@@ -3,9 +3,12 @@ import mediapipe as mp
 import numpy as np
 import librosa
 import json
-import tempfile
 import os
-from fastapi import UploadFile
+import logging
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class DanceAnalyzer:
     def __init__(self):
@@ -17,23 +20,31 @@ class DanceAnalyzer:
             min_detection_confidence=0.5
         )
 
-    async def analyze_video(self, file: UploadFile, status_callback=None):
-        # Save uploaded file temporarily
-        temp_dir = tempfile.mkdtemp()
-        temp_path = os.path.join(temp_dir, file.filename)
+    def analyze_video(self, file_path: str):
+        """
+        Generator function that yields progress updates and finally the result.
+        """
+        logger.info(f"Starting analysis for {file_path}")
+        yield {"status": "starting", "progress": 0, "message": "Initializing analysis..."}
 
-        with open(temp_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+        start_time = time.time()
 
         # 1. Pose Analysis with MediaPipe
-        cap = cv2.VideoCapture(temp_path)
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+             yield {"status": "error", "progress": 0, "message": "Could not open video file"}
+             return
+
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         pose_data = []
         frames_processed = 0
 
+        logger.info(f"Video info: FPS={fps}, Frames={frame_count}")
+        yield {"status": "processing_video", "progress": 0, "message": f"Starting video processing ({frame_count} frames)..."}
+
+        pose_start = time.time()
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -61,14 +72,28 @@ class DanceAnalyzer:
             pose_data.append(frame_data)
             frames_processed += 1
 
-            if status_callback and frames_processed % 30 == 0:
-                await status_callback(frames_processed / frame_count * 0.5) # 50% for visual
+            # Yield progress every 10 frames or if it's the last frame
+            if frames_processed % 10 == 0 or frames_processed == frame_count:
+                # Video processing is allocated 70% of the progress bar
+                progress = (frames_processed / max(frame_count, 1)) * 0.7
+                yield {
+                    "status": "processing_video",
+                    "progress": round(progress, 3),
+                    "message": f"Processing video frame {frames_processed}/{frame_count}"
+                }
 
         cap.release()
+        pose_end = time.time()
+        logger.info(f"Pose analysis took {pose_end - pose_start:.2f}s")
 
         # 2. Audio Analysis with Librosa
+        yield {"status": "processing_audio", "progress": 0.7, "message": "Analyzing audio..."}
+        audio_start = time.time()
+
+        audio_data = {}
         try:
-            y, sr = librosa.load(temp_path)
+            # Librosa can be slow, especially loading
+            y, sr = librosa.load(file_path)
             onset_env = librosa.onset.onset_strength(y=y, sr=sr)
             tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
             duration = librosa.get_duration(y=y, sr=sr)
@@ -80,23 +105,28 @@ class DanceAnalyzer:
                 "sr": sr
             }
         except Exception as e:
-            print(f"Audio analysis failed: {e}")
+            logger.error(f"Audio analysis failed: {e}")
             audio_data = {"error": str(e)}
 
-        if status_callback:
-            await status_callback(1.0)
+        audio_end = time.time()
+        logger.info(f"Audio analysis took {audio_end - audio_start:.2f}s")
+        yield {"status": "processing_audio", "progress": 0.9, "message": "Audio analysis complete"}
 
-        # Cleanup
-        os.remove(temp_path)
-        os.rmdir(temp_dir)
-
+        # 3. Calculate Metrics
+        yield {"status": "calculating_metrics", "progress": 0.95, "message": "Calculating metrics..."}
         metrics = self.calculate_metrics(pose_data, audio_data)
 
-        return {
+        final_result = {
             "pose_data": pose_data,
             "audio_data": audio_data,
             "metrics": metrics
         }
+
+        total_time = time.time() - start_time
+        logger.info(f"Total analysis took {total_time:.2f}s")
+
+        # Yield final result
+        yield {"status": "complete", "progress": 1.0, "message": "Analysis complete", "result": final_result}
 
     def calculate_metrics(self, pose_data, audio_data):
         if not pose_data:

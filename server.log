@@ -1,0 +1,41 @@
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [9396]
+INFO:     Started server process [12306]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1766195554.718073   12454 inference_feedback_manager.cc:114] Feedback manager requires a model with a single signature inference. Disabling support for feedback tensors.
+W0000 00:00:1766195554.886598   12454 inference_feedback_manager.cc:114] Feedback manager requires a model with a single signature inference. Disabling support for feedback tensors.
+INFO:     127.0.0.1:58602 - "POST /api/v1/analyze-stream HTTP/1.1" 200 OK
+INFO:analyzer:Starting analysis for /tmp/tmpuj910562.mp4
+INFO:analyzer:Video info: FPS=30.0, Frames=150
+INFO:analyzer:Pose analysis took 4.52s
+/app/backend/analyzer.py:96: UserWarning: PySoundFile failed. Trying audioread instead.
+  y, sr = librosa.load(file_path)
+/home/jules/.pyenv/versions/3.12.12/lib/python3.12/site-packages/librosa/core/audio.py:184: FutureWarning: librosa.core.audio.__audioread_load
+	Deprecated as of librosa version 0.10.0.
+	It will be removed in librosa version 1.0.
+  y, sr_native = __audioread_load(path, offset, duration, dtype)
+ERROR:analyzer:Audio analysis failed:
+INFO:analyzer:Audio analysis took 6.55s
+INFO:analyzer:Total analysis took 11.07s
+INFO:     127.0.0.1:44750 - "POST /api/v1/analyze HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:44750 - "GET /api/v1/status/dummy_video.mp4 HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:46252 - "POST /api/v1/analyze-stream HTTP/1.1" 200 OK
+INFO:analyzer:Starting analysis for /tmp/tmpa0g3l3ax.mp4
+INFO:analyzer:Video info: FPS=30.0, Frames=150
+INFO:analyzer:Pose analysis took 4.67s
+ERROR:analyzer:Audio analysis failed:
+INFO:analyzer:Audio analysis took 0.00s
+INFO:analyzer:Total analysis took 4.67s
+INFO:     127.0.0.1:33246 - "POST /api/v1/analyze-stream HTTP/1.1" 200 OK
+INFO:analyzer:Starting analysis for /tmp/tmpv7wjtnnr.mp4
+INFO:analyzer:Video info: FPS=30.0, Frames=150
+INFO:analyzer:Pose analysis took 4.54s
+ERROR:analyzer:Audio analysis failed:
+INFO:analyzer:Audio analysis took 0.00s
+INFO:analyzer:Total analysis took 4.55s
