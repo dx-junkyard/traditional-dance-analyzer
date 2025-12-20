@@ -153,6 +153,7 @@ class DanceAnalyzer:
             static_image_mode=False,
             model_complexity=2,
             enable_segmentation=True,
+            smooth_segmentation=False,
             min_detection_confidence=0.5
         ) as pose:
 
