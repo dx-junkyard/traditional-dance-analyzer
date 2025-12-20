@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 def extract_torso_roi(image, landmarks):
     """
     Extracts the torso ROI based on shoulder (11, 12) and hip (23, 24) landmarks.
-    Landmarks are normalized [0, 1].
+    Landmarks are normalized [0, 1] relative to the image dimensions.
     """
     h, w, _ = image.shape
 
@@ -53,8 +53,10 @@ def extract_torso_roi(image, landmarks):
 def calculate_color_histogram(image):
     """
     Calculates normalized 2D HSV histogram (Hue and Saturation).
+    Input image is expected to be RGB.
     """
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # Convert RGB to HSV
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
     # 30 bins for Hue, 32 for Saturation
     hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
@@ -147,8 +149,7 @@ class DanceAnalyzer:
 
         start_time = time.time()
 
-        # Initialize Pose here with context manager to reset internal graph state
-        # specifically SegmentationSmoothingCalculator which caused crashes on reuse.
+        # Initialize Pose here with context manager
         with self.mp_pose.Pose(
             static_image_mode=False,
             model_complexity=2,
@@ -164,6 +165,8 @@ class DanceAnalyzer:
 
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
             pose_data = []
             frames_processed = 0
@@ -171,23 +174,11 @@ class DanceAnalyzer:
             logger.info(f"Video info: FPS={fps}, Frames={frame_count}")
             yield {"status": "processing_video", "progress": 0, "message": f"Starting video processing ({frame_count} frames)..."}
 
-            # Tracking State
+            # --- Tracking Initialization ---
             target_hist = None
-            last_bbox = None
+            last_bbox = None # [x, y, w, h] normalized
 
-            if tracking_config and "target_bbox" in tracking_config:
-                last_bbox = tracking_config["target_bbox"]
-                if isinstance(last_bbox, dict):
-                    last_bbox = [last_bbox['x'], last_bbox['y'], last_bbox['width'], last_bbox['height']]
-
-            pose_start = time.time()
-            histogram_initialized = False
-
-            # For tracking in the loop, we also need a detector for re-acquisition?
-            # The previous implementation used self.detector.
-            # We need to instantiate a local detector here as well if we want to use it for tracking.
-            # Tracking logic relied on 'self.detector.detect(mp_image)'
-
+            # Initialize Object Detector
             options = self.ObjectDetectorOptions(
                 base_options=self.BaseOptions(model_asset_path=self.model_path),
                 running_mode=self.VisionRunningMode.IMAGE,
@@ -197,106 +188,216 @@ class DanceAnalyzer:
             detector = self.ObjectDetector.create_from_options(options)
 
             try:
+                # 1. Initial Target Setup (if config provided)
+                if tracking_config and "target_bbox" in tracking_config:
+                    tb = tracking_config["target_bbox"]
+                    # Ensure list format [x, y, w, h]
+                    if isinstance(tb, dict):
+                        last_bbox = [tb['x'], tb['y'], tb['width'], tb['height']]
+                    else:
+                        last_bbox = tb
+
+                    # Compute initial histogram from the first frame
+                    ret, first_frame = cap.read()
+                    if ret:
+                        # Convert to RGB for consistency
+                        first_frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+
+                        # Extract ROI for histogram from initial bbox
+                        lx, ly, lw, lh = last_bbox
+                        px = int(lx * width)
+                        py = int(ly * height)
+                        pw = int(lw * width)
+                        ph = int(lh * height)
+
+                        # Clamp
+                        px = max(0, px); py = max(0, py)
+                        pw = min(width - px, pw); ph = min(height - py, ph)
+
+                        if pw > 0 and ph > 0:
+                            # Try to extract Torso for better color representation
+                            init_roi = first_frame_rgb[py:py+ph, px:px+pw]
+
+                            # Run Pose on this ROI to find torso
+                            # This might fail if the crop is too small or pose not visible, but worth a try
+                            init_results = pose.process(init_roi)
+                            if init_results.pose_landmarks:
+                                torso_roi = extract_torso_roi(init_roi, init_results.pose_landmarks.landmark)
+                                if torso_roi is not None:
+                                    target_hist = calculate_color_histogram(torso_roi)
+
+                            # Fallback: use the whole bbox (or center) if torso extraction failed
+                            if target_hist is None:
+                                target_hist = calculate_color_histogram(init_roi)
+
+                        # Reset cap to frame 0 for processing loop
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    else:
+                        logger.warning("Could not read first frame for target initialization")
+
+                pose_start = time.time()
+
+                # Main Loop
                 while cap.isOpened():
                     ret, frame = cap.read()
                     if not ret:
                         break
 
+                    # Convert to RGB
+                    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     h, w, _ = frame.shape
-                    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
 
                     # --- Tracking Logic ---
-                    current_roi_image = image
-                    roi_offset_x = 0
-                    roi_offset_y = 0
+                    # 1. Define Search Region (ROI)
+                    search_roi_img = image_rgb
+                    offset_x, offset_y = 0, 0
+                    is_full_scan = True
 
                     if last_bbox:
-                        if not histogram_initialized:
-                            # Initialize Histogram
-                            lx, ly, lw, lh = last_bbox
-                            px, py = int(lx * w), int(ly * h)
-                            pw, ph = int(lw * w), int(lh * h)
+                        # Create a search ROI around last_bbox
+                        lx, ly, lw, lh = last_bbox
+                        cx, cy = lx + lw/2, ly + lh/2
 
-                            px = max(0, px); py = max(0, py)
-                            pw = min(w - px, pw); ph = min(h - py, ph)
+                        # Search window: 2x the previous box size to allow movement
+                        search_w = max(lw * 2.0, 0.3)
+                        search_h = max(lh * 2.0, 0.3)
 
-                            if pw > 0 and ph > 0:
-                                roi = image[py:py+ph, px:px+pw]
-                                # Use local pose
-                                pose_results = pose.process(roi)
-                                if pose_results.pose_landmarks:
-                                    torso_roi = extract_torso_roi(roi, pose_results.pose_landmarks.landmark)
-                                    if torso_roi is not None:
-                                        target_hist = calculate_color_histogram(torso_roi)
-                                        histogram_initialized = True
+                        sx = cx - search_w / 2
+                        sy = cy - search_h / 2
 
-                                if not histogram_initialized:
-                                    target_hist = calculate_color_histogram(roi)
-                                    histogram_initialized = True
+                        # Convert to pixels
+                        psx = int(sx * w)
+                        psy = int(sy * h)
+                        psw = int(search_w * w)
+                        psh = int(search_h * h)
 
-                        # Track
-                        # Use local detector
-                        det_results = detector.detect(mp_image)
-                        best_bbox = None
-                        best_score = -1
+                        # Handle boundaries
+                        psx = max(0, psx); psy = max(0, psy)
+                        psw = min(w - psx, psw); psh = min(h - psy, psh)
 
-                        if det_results.detections and histogram_initialized:
-                            for detection in det_results.detections:
-                                if detection.categories[0].category_name != 'person':
-                                    continue
+                        if psw > 0 and psh > 0:
+                            search_roi_img = image_rgb[psy:psy+psh, psx:psx+psw]
+                            offset_x = psx
+                            offset_y = psy
+                            is_full_scan = False
 
-                                bboxC = detection.bounding_box
-                                cx_norm, cy_norm = bboxC.origin_x / w, bboxC.origin_y / h
-                                cw_norm, ch_norm = bboxC.width / w, bboxC.height / h
+                    # 2. Detect in Search Region
+                    # Ensure data is contiguous for mp.Image
+                    if not search_roi_img.flags['C_CONTIGUOUS']:
+                        search_roi_img = np.ascontiguousarray(search_roi_img)
 
+                    mp_search_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=search_roi_img)
+                    detection_result = detector.detect(mp_search_img)
+                    detections = detection_result.detections
+
+                    # Fallback to full scan if no detections in ROI
+                    if not detections and not is_full_scan:
+                        is_full_scan = True
+                        search_roi_img = image_rgb
+                        offset_x, offset_y = 0, 0
+
+                        if not search_roi_img.flags['C_CONTIGUOUS']:
+                            search_roi_img = np.ascontiguousarray(search_roi_img)
+
+                        mp_search_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=search_roi_img)
+                        detection_result = detector.detect(mp_search_img)
+                        detections = detection_result.detections
+
+                    # 3. Identify Best Candidate
+                    best_candidate = None
+                    best_score = -1.0
+
+                    if detections:
+                        for detection in detections:
+                            if detection.categories[0].category_name != 'person':
+                                continue
+
+                            bboxC = detection.bounding_box
+                            # Convert to global normalized coordinates
+                            gx = (bboxC.origin_x + offset_x) / w
+                            gy = (bboxC.origin_y + offset_y) / h
+                            gw = bboxC.width / w
+                            gh = bboxC.height / h
+
+                            candidate_bbox = [gx, gy, gw, gh]
+
+                            # Score 1: Spatial Consistency (Distance)
+                            score_dist = 0.0
+                            if last_bbox:
                                 lcx = last_bbox[0] + last_bbox[2]/2
                                 lcy = last_bbox[1] + last_bbox[3]/2
-                                ccx = cx_norm + cw_norm/2
-                                ccy = cy_norm + ch_norm/2
-
+                                ccx = gx + gw/2
+                                ccy = gy + gh/2
                                 dist = np.sqrt((lcx - ccx)**2 + (lcy - ccy)**2)
                                 score_dist = max(0, 1.0 - dist * 2)
+                            else:
+                                score_dist = 1.0 # No prior info
 
-                                px, py = int(cx_norm * w), int(cy_norm * h)
-                                pw, ph = int(cw_norm * w), int(ch_norm * h)
+                            # Score 2: Color Consistency
+                            score_color = 0.0
+                            if target_hist is not None:
+                                # Extract candidate ROI (global coords)
+                                px = int(gx * w)
+                                py = int(gy * h)
+                                pw = int(gw * w)
+                                ph = int(gh * h)
+
                                 px = max(0, px); py = max(0, py)
                                 pw = min(w - px, pw); ph = min(h - py, ph)
 
-                                score_hist = 0
                                 if pw > 0 and ph > 0:
-                                    cand_roi = image[py:py+ph, px:px+pw]
-                                    cand_hist = calculate_color_histogram(cand_roi)
-                                    score_hist = cv2.compareHist(target_hist, cand_hist, cv2.HISTCMP_CORREL)
+                                    # Use central crop (50%) to approximate torso/reduce bg
+                                    cx_roi = px + pw//4
+                                    cy_roi = py + ph//4
+                                    cw_roi = pw // 2
+                                    ch_roi = ph // 2
 
-                                total_score = 0.6 * score_dist + 0.4 * score_hist
+                                    if cw_roi > 0 and ch_roi > 0:
+                                        cand_roi = image_rgb[cy_roi:cy_roi+ch_roi, cx_roi:cx_roi+cw_roi]
+                                        cand_hist = calculate_color_histogram(cand_roi)
+                                        score_color = cv2.compareHist(target_hist, cand_hist, cv2.HISTCMP_CORREL)
+                                        score_color = max(0, score_color)
+                            else:
+                                score_color = 0.5
 
-                                if total_score > best_score:
-                                    best_score = total_score
-                                    best_bbox = [cx_norm, cy_norm, cw_norm, ch_norm]
+                            # Weighted Score
+                            total_score = 0.6 * score_dist + 0.4 * score_color
 
-                        if best_bbox:
-                            last_bbox = best_bbox
-                            lx, ly, lw, lh = last_bbox
-                            px, py = int(lx * w), int(ly * h)
-                            pw, ph = int(lw * w), int(lh * h)
+                            if total_score > best_score:
+                                best_score = total_score
+                                best_candidate = candidate_bbox
 
-                            pad_x = int(pw * 0.2)
-                            pad_y = int(ph * 0.2)
-                            px_pad = max(0, px - pad_x)
-                            py_pad = max(0, py - pad_y)
-                            pw_pad = min(w - px_pad, pw + 2 * pad_x)
-                            ph_pad = min(h - py_pad, ph + 2 * pad_y)
+                    # Update Tracker
+                    if best_candidate:
+                        last_bbox = best_candidate
 
-                            if pw_pad > 0 and ph_pad > 0:
-                                current_roi_image = image[py_pad:py_pad+ph_pad, px_pad:px_pad+pw_pad]
-                                roi_offset_x = px_pad
-                                roi_offset_y = py_pad
+                    # --- Pose Analysis ---
 
-                    # --- End Tracking Logic ---
+                    # Determine ROI for Pose (Focus on the tracked person)
+                    pose_roi_img = image_rgb
+                    pose_offset_x, pose_offset_y = 0, 0
 
-                    # Run Pose on the selected ROI
-                    results = pose.process(current_roi_image)
+                    if last_bbox:
+                        lx, ly, lw, lh = last_bbox
+                        # Padding for Pose (20%)
+                        pad_w = lw * 0.2
+                        pad_h = lh * 0.2
+
+                        px = int((lx - pad_w) * w)
+                        py = int((ly - pad_h) * h)
+                        pw_ = int((lw + 2*pad_w) * w)
+                        ph_ = int((lh + 2*pad_h) * h)
+
+                        px = max(0, px); py = max(0, py)
+                        pw_ = min(w - px, pw_); ph_ = min(h - py, ph_)
+
+                        if pw_ > 0 and ph_ > 0:
+                            pose_roi_img = image_rgb[py:py+ph_, px:px+pw_]
+                            pose_offset_x = px
+                            pose_offset_y = py
+
+                    # Run Pose
+                    results = pose.process(pose_roi_img)
 
                     frame_data = {
                         "frame": frames_processed,
@@ -306,12 +407,13 @@ class DanceAnalyzer:
 
                     if results.pose_landmarks:
                         for lm in results.pose_landmarks.landmark:
-                            if roi_offset_x > 0 or roi_offset_y > 0:
-                                global_x = (lm.x * current_roi_image.shape[1] + roi_offset_x) / w
-                                global_y = (lm.y * current_roi_image.shape[0] + roi_offset_y) / h
-                            else:
-                                global_x = lm.x
-                                global_y = lm.y
+                            # Convert back to global coordinates
+                            # lm is normalized [0,1] relative to pose_roi_img
+                            # Global pixel = lm * roi_dim + offset
+                            # Global norm = Global pixel / full_dim
+
+                            global_x = (lm.x * pose_roi_img.shape[1] + pose_offset_x) / w
+                            global_y = (lm.y * pose_roi_img.shape[0] + pose_offset_y) / h
 
                             frame_data["landmarks"].append({
                                 "x": global_x,
@@ -332,7 +434,7 @@ class DanceAnalyzer:
                         }
             finally:
                 cap.release()
-                detector.close() # Clean up local detector
+                detector.close()
 
             pose_end = time.time()
             logger.info(f"Pose analysis took {pose_end - pose_start:.2f}s")
