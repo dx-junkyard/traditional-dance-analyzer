@@ -6,9 +6,59 @@ import json
 import os
 import logging
 import time
+import base64
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def extract_torso_roi(image, landmarks):
+    """
+    Extracts the torso ROI based on shoulder (11, 12) and hip (23, 24) landmarks.
+    Landmarks are normalized [0, 1].
+    """
+    h, w, _ = image.shape
+
+    # Get coordinates
+    pts = [
+        landmarks[11], # Left Shoulder
+        landmarks[12], # Right Shoulder
+        landmarks[23], # Left Hip
+        landmarks[24]  # Right Hip
+    ]
+
+    # Convert to pixel coords
+    pixel_pts = []
+    for pt in pts:
+        pixel_pts.append([int(pt.x * w), int(pt.y * h)])
+
+    pixel_pts = np.array(pixel_pts)
+
+    # Get bounding rect of these points
+    x, y, bw, bh = cv2.boundingRect(pixel_pts)
+
+    # Add slight padding
+    pad_x = int(bw * 0.1)
+    pad_y = int(bh * 0.1)
+
+    x = max(0, x - pad_x)
+    y = max(0, y - pad_y)
+    bw = min(w - x, bw + 2 * pad_x)
+    bh = min(h - y, bh + 2 * pad_y)
+
+    if bw <= 0 or bh <= 0:
+        return None
+
+    return image[y:y+bh, x:x+bw]
+
+def calculate_color_histogram(image):
+    """
+    Calculates normalized 2D HSV histogram (Hue and Saturation).
+    """
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # 30 bins for Hue, 32 for Saturation
+    hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+    return hist
 
 class DanceAnalyzer:
     def __init__(self):
@@ -20,9 +70,82 @@ class DanceAnalyzer:
             min_detection_confidence=0.5
         )
 
-    def analyze_video(self, file_path: str):
+        # Check for TFLite model, use relative path or download
+        model_path = os.path.join(os.getcwd(), 'efficientdet_lite0.tflite')
+
+        BaseOptions = mp.tasks.BaseOptions
+        ObjectDetector = mp.tasks.vision.ObjectDetector
+        ObjectDetectorOptions = mp.tasks.vision.ObjectDetectorOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
+
+        options = ObjectDetectorOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=VisionRunningMode.IMAGE,
+            max_results=5,
+            score_threshold=0.3
+        )
+        self.detector = ObjectDetector.create_from_options(options)
+
+    def find_candidates(self, file_path: str):
+        """
+        Scans the video for the first valid frame with people.
+        Returns the frame (base64) and a list of candidate bounding boxes.
+        """
+        cap = cv2.VideoCapture(file_path)
+        candidates = []
+        frame_base64 = None
+
+        frames_to_check = 30 # Check first 30 frames for a good shot
+
+        for _ in range(frames_to_check):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+
+            results = self.detector.detect(mp_image)
+
+            if results.detections:
+                h, w, _ = frame.shape
+                valid_detections = []
+                for i, detection in enumerate(results.detections):
+                    # For efficientdet_lite0, class 'person' usually has index 0 if labeled,
+                    # but detection.categories[0].category_name should be checked.
+                    # Or we just accept all objects (usually people in dance videos) or filter by 'person'.
+
+                    category = detection.categories[0]
+                    if category.category_name != 'person':
+                        continue
+
+                    bboxC = detection.bounding_box
+                    # mp.tasks returns pixel coordinates in bounding_box (origin_x, origin_y, width, height)
+                    # We normalize it for the frontend
+                    bbox = {
+                        "id": i,
+                        "x": bboxC.origin_x / w,
+                        "y": bboxC.origin_y / h,
+                        "width": bboxC.width / w,
+                        "height": bboxC.height / h,
+                        "score": category.score
+                    }
+                    valid_detections.append(bbox)
+
+                if valid_detections:
+                    candidates = valid_detections
+                    # Encode frame to base64
+                    _, buffer = cv2.imencode('.jpg', frame)
+                    frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                    break # Found candidates
+
+        cap.release()
+        return {"image": frame_base64, "candidates": candidates}
+
+    def analyze_video(self, file_path: str, tracking_config: dict = None):
         """
         Generator function that yields progress updates and finally the result.
+        tracking_config: {"target_bbox": [x, y, w, h]} normalized
         """
         logger.info(f"Starting analysis for {file_path}")
         yield {"status": "starting", "progress": 0, "message": "Initializing analysis..."}
@@ -44,15 +167,140 @@ class DanceAnalyzer:
         logger.info(f"Video info: FPS={fps}, Frames={frame_count}")
         yield {"status": "processing_video", "progress": 0, "message": f"Starting video processing ({frame_count} frames)..."}
 
+        # Tracking State
+        target_hist = None
+        last_bbox = None # [x, y, w, h] normalized
+
+        if tracking_config and "target_bbox" in tracking_config:
+            last_bbox = tracking_config["target_bbox"]
+            # Convert dict/list if needed. Assuming list [x, y, w, h]
+            if isinstance(last_bbox, dict):
+                last_bbox = [last_bbox['x'], last_bbox['y'], last_bbox['width'], last_bbox['height']]
+
         pose_start = time.time()
+
+        # We need to initialize the histogram on the first frame where target is visible
+        # If we have an initial bbox, we use it on frame 0 (or first frame read).
+        histogram_initialized = False
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # Convert BGR to RGB
+            h, w, _ = frame.shape
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.pose.process(image)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+
+            # --- Tracking Logic ---
+            current_roi_image = image # Default to full image
+            roi_offset_x = 0
+            roi_offset_y = 0
+
+            # If we have a target to track
+            if last_bbox:
+                # 1. Initialize Histogram if needed
+                if not histogram_initialized:
+                    # Crop to last_bbox
+                    lx, ly, lw, lh = last_bbox
+                    px, py = int(lx * w), int(ly * h)
+                    pw, ph = int(lw * w), int(lh * h)
+
+                    # Ensure within bounds
+                    px = max(0, px); py = max(0, py)
+                    pw = min(w - px, pw); ph = min(h - py, ph)
+
+                    if pw > 0 and ph > 0:
+                        roi = image[py:py+ph, px:px+pw]
+                        pose_results = self.pose.process(roi)
+                        if pose_results.pose_landmarks:
+                            torso_roi = extract_torso_roi(roi, pose_results.pose_landmarks.landmark)
+                            if torso_roi is not None:
+                                target_hist = calculate_color_histogram(torso_roi)
+                                histogram_initialized = True
+
+                        # Fallback
+                        if not histogram_initialized:
+                            target_hist = calculate_color_histogram(roi)
+                            histogram_initialized = True
+
+                # 2. Track in current frame
+                # Detect all candidates
+                det_results = self.detector.detect(mp_image)
+                best_bbox = None
+                best_score = -1
+
+                if det_results.detections and histogram_initialized:
+                    for detection in det_results.detections:
+                        # Check category
+                        if detection.categories[0].category_name != 'person':
+                            continue
+
+                        bboxC = detection.bounding_box
+                        # Convert to normalized
+                        cx_norm, cy_norm = bboxC.origin_x / w, bboxC.origin_y / h
+                        cw_norm, ch_norm = bboxC.width / w, bboxC.height / h
+
+                        # Score 1: Spatial (IOU or Distance) - using Distance between centers
+                        # Last center
+                        lcx = last_bbox[0] + last_bbox[2]/2
+                        lcy = last_bbox[1] + last_bbox[3]/2
+                        # Current center
+                        ccx = cx_norm + cw_norm/2
+                        ccy = cy_norm + ch_norm/2
+
+                        dist = np.sqrt((lcx - ccx)**2 + (lcy - ccy)**2)
+                        score_dist = max(0, 1.0 - dist * 2) # Penalize distance heavily
+
+                        # Score 2: Visual (Histogram)
+                        # Extract ROI for candidate
+                        px, py = int(cx_norm * w), int(cy_norm * h)
+                        pw, ph = int(cw_norm * w), int(ch_norm * h)
+                        px = max(0, px); py = max(0, py)
+                        pw = min(w - px, pw); ph = min(h - py, ph)
+
+                        score_hist = 0
+                        if pw > 0 and ph > 0:
+                            cand_roi = image[py:py+ph, px:px+pw]
+                            cand_hist = calculate_color_histogram(cand_roi)
+                            # Compare
+                            score_hist = cv2.compareHist(target_hist, cand_hist, cv2.HISTCMP_CORREL)
+
+                        # Combined Score
+                        total_score = 0.6 * score_dist + 0.4 * score_hist
+
+                        if total_score > best_score:
+                            best_score = total_score
+                            best_bbox = [cx_norm, cy_norm, cw_norm, ch_norm]
+
+                # Update tracking state
+                if best_bbox:
+                    last_bbox = best_bbox
+                    # Prepare ROI for Pose Analysis
+                    lx, ly, lw, lh = last_bbox
+                    px, py = int(lx * w), int(ly * h)
+                    pw, ph = int(lw * w), int(lh * h)
+
+                    # Add padding for Pose stability
+                    pad_x = int(pw * 0.2)
+                    pad_y = int(ph * 0.2)
+                    px_pad = max(0, px - pad_x)
+                    py_pad = max(0, py - pad_y)
+                    pw_pad = min(w - px_pad, pw + 2 * pad_x)
+                    ph_pad = min(h - py_pad, ph + 2 * pad_y)
+
+                    if pw_pad > 0 and ph_pad > 0:
+                        current_roi_image = image[py_pad:py_pad+ph_pad, px_pad:px_pad+pw_pad]
+                        roi_offset_x = px_pad
+                        roi_offset_y = py_pad
+                else:
+                    # Keep previous bbox as best guess, but maybe expand search next time?
+                    pass
+
+            # --- End Tracking Logic ---
+
+            # Run Pose on the selected ROI
+            results = self.pose.process(current_roi_image)
 
             frame_data = {
                 "frame": frames_processed,
@@ -62,9 +310,18 @@ class DanceAnalyzer:
 
             if results.pose_landmarks:
                 for lm in results.pose_landmarks.landmark:
+                    # Adjust landmarks back to global coordinates if we cropped
+                    if roi_offset_x > 0 or roi_offset_y > 0:
+                        # lm.x is relative to crop width
+                        global_x = (lm.x * current_roi_image.shape[1] + roi_offset_x) / w
+                        global_y = (lm.y * current_roi_image.shape[0] + roi_offset_y) / h
+                    else:
+                        global_x = lm.x
+                        global_y = lm.y
+
                     frame_data["landmarks"].append({
-                        "x": lm.x,
-                        "y": lm.y,
+                        "x": global_x,
+                        "y": global_y,
                         "z": lm.z,
                         "visibility": lm.visibility
                     })
@@ -72,9 +329,7 @@ class DanceAnalyzer:
             pose_data.append(frame_data)
             frames_processed += 1
 
-            # Yield progress every 10 frames or if it's the last frame
             if frames_processed % 10 == 0 or frames_processed == frame_count:
-                # Video processing is allocated 70% of the progress bar
                 progress = (frames_processed / max(frame_count, 1)) * 0.7
                 yield {
                     "status": "processing_video",
