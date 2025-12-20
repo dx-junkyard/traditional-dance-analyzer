@@ -15,6 +15,12 @@ export default function HomePage() {
     const [statusMessage, setStatusMessage] = useState("");
     const [videoUrl, setVideoUrl] = useState<string | null>(null);
 
+    // New State for Selection Mode
+    const [selectionMode, setSelectionMode] = useState(false);
+    const [selectionImage, setSelectionImage] = useState<string | null>(null);
+    const [candidates, setCandidates] = useState<any[]>([]);
+    const [videoId, setVideoId] = useState<string | null>(null);
+
     useEffect(() => {
         // Simple token check
         const token = localStorage.getItem('token');
@@ -34,35 +40,85 @@ export default function HomePage() {
         setAnalysisResult(null);
         setFile(null);
         setVideoUrl(null);
+        resetSelection();
+    };
+
+    const resetSelection = () => {
+        setSelectionMode(false);
+        setSelectionImage(null);
+        setCandidates([]);
+        setVideoId(null);
     };
 
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         if (e.target.files && e.target.files[0]) {
             setFile(e.target.files[0]);
-            setVideoUrl(URL.createObjectURL(e.target.files[0]));
+            // Do not set videoUrl yet, wait for prepare
+            resetSelection();
+            setAnalysisResult(null);
         }
     };
 
-    const handleUpload = async () => {
-        console.log("Upload started");
-        if (!file) {
-            console.log("No file selected");
-            return;
-        }
+    const handlePrepare = async () => {
+        if (!file) return;
 
         setLoading(true);
-        setProgress(0);
-        setStatusMessage("Starting upload...");
-        setAnalysisResult(null);
+        setStatusMessage("Scanning video for dancers...");
+        setProgress(10); // Fake progress
 
         const formData = new FormData();
         formData.append('file', file);
 
         try {
-            console.log("Sending fetch request");
+            const res = await fetch('http://localhost:8000/api/v1/prepare', {
+                method: 'POST',
+                body: formData
+            });
+
+            if (!res.ok) throw new Error("Failed to prepare video");
+
+            const data = await res.json();
+            setVideoId(data.video_id);
+            setSelectionImage(data.frame_image);
+            setCandidates(data.candidates);
+            setSelectionMode(true);
+            setLoading(false);
+            setStatusMessage("Please select the dancer.");
+
+        } catch (e: any) {
+            console.error(e);
+            setStatusMessage(`Error: ${e.message}`);
+            setLoading(false);
+        }
+    };
+
+    const handleCandidateSelect = async (candidate: any) => {
+        if (!videoId) return;
+
+        setSelectionMode(false); // Hide selection UI
+        setLoading(true);
+        setStatusMessage("Starting analysis...");
+        setProgress(0);
+
+        // We set the Video URL for the player now, but ideally we should wait
+        // or use the blob we have locally if possible.
+        // Actually, for playback, we need the file.
+        // `file` is in state, so we can make a URL for it.
+        if (file) {
+            setVideoUrl(URL.createObjectURL(file));
+        }
+
+        try {
+            console.log("Sending analysis request for video", videoId);
             const response = await fetch('http://localhost:8000/api/v1/analyze-stream', {
                 method: 'POST',
-                body: formData,
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    video_id: videoId,
+                    selected_candidate: candidate
+                }),
             });
 
             console.log("Fetch response received", response.status);
@@ -82,7 +138,6 @@ export default function HomePage() {
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\n');
 
-                // Process all complete lines
                 buffer = lines.pop() || '';
 
                 for (const line of lines) {
@@ -96,7 +151,6 @@ export default function HomePage() {
                             setProgress(100);
                         } else if (data.status === 'error') {
                             setStatusMessage(`Error: ${data.message}`);
-                            // Stop processing if error
                             break;
                         } else {
                             if (data.progress !== undefined) {
@@ -179,8 +233,15 @@ export default function HomePage() {
                     <div className="lg:col-span-2 space-y-6">
                         <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
                             <div className="mb-6 aspect-video bg-gray-100 rounded-lg overflow-hidden flex items-center justify-center relative">
-                                {videoUrl ? (
-                                     <VideoAnalyzer src={videoUrl || undefined} poseData={analysisResult?.pose_data} />
+                                {videoUrl || selectionMode ? (
+                                     <VideoAnalyzer
+                                        src={videoUrl || undefined}
+                                        poseData={analysisResult?.pose_data}
+                                        selectionMode={selectionMode}
+                                        selectionImage={selectionImage || undefined}
+                                        candidates={candidates}
+                                        onSelectCandidate={handleCandidateSelect}
+                                     />
                                 ) : (
                                     <div className="text-center p-10">
                                         <div className="bg-blue-50 w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4">
@@ -205,16 +266,18 @@ export default function HomePage() {
                                     file:shadow-sm
                                     hover:file:bg-gray-50 cursor-pointer"
                                 />
-                                <button
-                                    onClick={handleUpload}
-                                    disabled={!file || loading}
-                                    className="w-full sm:w-auto flex items-center justify-center gap-2 bg-[#0F172A] text-white px-8 py-2.5 rounded-full hover:bg-[#1E293B] disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-medium shadow-md"
-                                >
-                                    <Activity size={18} />
-                                    {loading ? 'Analyzing...' : 'Analyze'}
-                                </button>
+                                { !selectionMode && !videoUrl && (
+                                    <button
+                                        onClick={handlePrepare}
+                                        disabled={!file || loading}
+                                        className="w-full sm:w-auto flex items-center justify-center gap-2 bg-[#0F172A] text-white px-8 py-2.5 rounded-full hover:bg-[#1E293B] disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-medium shadow-md"
+                                    >
+                                        <Activity size={18} />
+                                        {loading ? 'Processing...' : 'Start'}
+                                    </button>
+                                )}
                             </div>
-                            {/* Progress Bar & Status - Show status if loading OR if there is a message */}
+                            {/* Progress Bar & Status */}
                             {(loading || statusMessage) && (
                                 <div className="mt-6 space-y-2">
                                     <div className="flex justify-between text-sm font-medium text-gray-600">
