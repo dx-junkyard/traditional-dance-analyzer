@@ -8,3 +8,4 @@ mysql-connector-python==8.3.0
 qdrant-client==1.7.3
 python-multipart==0.0.9
 numpy
+ultralytics
