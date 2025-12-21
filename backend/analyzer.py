@@ -88,9 +88,10 @@ class PoseValidator:
             if y_shoulder > y_hip:
                  return False, "Shoulders below hips"
 
-        if y_hip is not None and y_knee is not None:
-            if y_hip > y_knee:
-                return False, "Hips below knees"
+        # Yasuki-Bushi / Squat support:
+        # We allow Knees to be higher than Hips (squatting), so we REMOVE strict "Hips < Knees" check.
+        # But we still want to ensure Knees are not lower than Ankles (standing on head?)
+        # Actually Knees < Ankles is usually true even in squat.
 
         if y_knee is not None and y_ankle is not None:
             if y_knee > y_ankle:
@@ -187,11 +188,20 @@ class PersonProfile:
         self._check_static()
 
     def _check_static(self):
+        # Check static state (enhanced for background rejection)
+        # If we have at least 10 frames, check variance of recent history
+        if len(self.positions) >= 10:
+            recent_pts = np.array(self.positions[-10:])
+            var = np.var(recent_pts, axis=0)
+            if np.mean(var) < 1e-5:
+                self.is_static = True
+                return
+
         if len(self.positions) < self.history_len:
             self.is_static = False
             return
 
-        # Calculate variance of positions
+        # Calculate variance of positions (full history)
         pts = np.array(self.positions)
         # pts is (N, 2)
         var = np.var(pts, axis=0) # [var_x, var_y]
@@ -413,6 +423,21 @@ class TrackerManager:
             self._update_target_state(detections)
             logger.info(f"Tracker initialized. Target ID: {self.target_id}")
 
+            # Blacklist all other detections immediately
+            for det in detections:
+                tid = det['id']
+                if tid != self.target_id:
+                    # If this ID exists in profiles, move it to exclusion
+                    if tid in self.profiles:
+                        prof = self.profiles[tid]
+                        self.historical_exclusions.append({
+                            'pos': prof.positions[-1],
+                            'ar': prof.aspect_ratio,
+                            'color': prof.color_hist
+                        })
+                        del self.profiles[tid]
+                        logger.info(f"Initial non-target ID {tid} added to exclusion blacklist.")
+
     def _matches_exclusion(self, pos, ar, hist):
         # Check against historical exclusions
         for exc in self.historical_exclusions:
@@ -441,14 +466,42 @@ class TrackerManager:
             if self._matches_exclusion(prof.positions[-1], prof.aspect_ratio, prof.color_hist):
                 continue
 
-            # 3. Score Calculation
-            # "Proximity (60%) + Color (40%)" - NO Aspect Ratio
+            # 3. Hard Gating (Spatial)
+            if self.target_last_bbox_pixel is not None:
+                # Convert candidate pos_norm to pixels for check
+                cand_cx = prof.positions[-1][0] * self.w
+                cand_cy = prof.positions[-1][1] * self.h # Note: self.h/w are image dims from __init__
+
+                last_w = self.target_last_bbox_pixel[2] - self.target_last_bbox_pixel[0]
+                last_h = self.target_last_bbox_pixel[3] - self.target_last_bbox_pixel[1]
+                last_cx = self.target_last_bbox_pixel[0] + last_w/2
+                last_cy = self.target_last_bbox_pixel[1] + last_h/2
+
+                dx = abs(cand_cx - last_cx)
+                dy = abs(cand_cy - last_cy)
+
+                # Rejection Criteria: Vertical > 0.5*H OR Horizontal > 1.0*W
+                if dy > 0.5 * last_h or dx > 1.0 * last_w:
+                    continue
+
+            # 4. Anatomical Validation
+            if prof.last_keypoints is not None:
+                valid_pose, _ = PoseValidator.validate_pose(
+                    prof.last_keypoints,
+                    prof.last_keypoint_confs if prof.last_keypoint_confs is not None else np.zeros(17),
+                    prof.prev_keypoints
+                )
+                if not valid_pose:
+                    continue
+
+            # 5. Score Calculation
+            # "Proximity (60%) + Color (40%)"
             if self.target_last_pos_norm is not None and self.target_last_hist is not None:
                 dist = np.linalg.norm(np.array(prof.positions[-1]) - np.array(self.target_last_pos_norm))
                 color_sim = FeatureExtractor.compare_histograms(prof.color_hist, self.target_last_hist)
 
                 # Norm Distance 0-1.
-                dist_score = max(0, 1.0 - (dist * 2)) # If dist > 0.5, score is 0
+                dist_score = max(0, 1.0 - (dist * 2))
 
                 score = 0.6 * dist_score + 0.4 * color_sim
 
