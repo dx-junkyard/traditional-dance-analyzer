@@ -125,24 +125,64 @@ export const VideoAnalyzer: React.FC<VideoAnalyzerProps> = ({
         // Find frame data closest to current time
         const currentFrameData = poseData.find((data) => Math.abs(data.timestamp - currentTime) < 0.1);
 
-        if (currentFrameData && currentFrameData.landmarks) {
+        if (currentFrameData) {
             const w = canvas.width;
             const h = canvas.height;
 
-            ctx.fillStyle = 'red';
-            ctx.strokeStyle = 'rgba(0, 255, 0, 0.8)';
-            ctx.lineWidth = 2;
+            // MediaPipe Pose Connections (Partial based on mapped points)
+            // Indices: 0:Nose, 11:LShoulder, 12:RShoulder, 13:LElbow, 14:RElbow,
+            // 15:LWrist, 16:RWrist, 23:LHip, 24:RHip, 25:LKnee, 26:RKnee, 27:LAnkle, 28:RAnkle
+            const connections = [
+                [11, 12], // Shoulders
+                [11, 13], [13, 15], // Left Arm
+                [12, 14], [14, 16], // Right Arm
+                [11, 23], [12, 24], // Torso sides
+                [23, 24], // Hips
+                [23, 25], [25, 27], // Left Leg
+                [24, 26], [26, 28]  // Right Leg
+            ];
 
-            currentFrameData.landmarks.forEach((lm: any) => {
-                const x = lm.x * w;
-                const y = lm.y * h;
+            const drawSkeleton = (landmarks: any[], isTarget: boolean) => {
+                const color = isTarget ? '#00FF00' : '#888888'; // Bright Green for Dancer, Gray for others
+                ctx.strokeStyle = color;
+                ctx.lineWidth = isTarget ? 4 : 2;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
 
-                if (lm.visibility > 0.5) {
-                    ctx.beginPath();
-                    ctx.arc(x, y, 3, 0, 2 * Math.PI);
-                    ctx.fill();
+                // Draw Connections
+                connections.forEach(([start, end]) => {
+                    const l1 = landmarks[start];
+                    const l2 = landmarks[end];
+
+                    if (l1 && l2 && l1.visibility > 0.3 && l2.visibility > 0.3) {
+                         ctx.beginPath();
+                         ctx.moveTo(l1.x * w, l1.y * h);
+                         ctx.lineTo(l2.x * w, l2.y * h);
+                         ctx.stroke();
+                    }
+                });
+
+                // Draw Label for Dancer
+                if (isTarget) {
+                    const head = landmarks[0]; // Nose
+                    if (head && head.visibility > 0.3) {
+                         ctx.fillStyle = '#00FF00';
+                         ctx.font = 'bold 24px sans-serif';
+                         ctx.textAlign = 'center';
+                         ctx.fillText("Dancer", head.x * w, head.y * h - 20);
+                    }
                 }
-            });
+            };
+
+            // Handle new 'people' structure or fallback to 'landmarks'
+            if (currentFrameData.people && currentFrameData.people.length > 0) {
+                currentFrameData.people.forEach((person: any) => {
+                    drawSkeleton(person.landmarks, person.is_target);
+                });
+            } else if (currentFrameData.landmarks) {
+                // Legacy/Single target fallback
+                drawSkeleton(currentFrameData.landmarks, true);
+            }
         }
     }, [currentTime, poseData, selectionMode]);
 

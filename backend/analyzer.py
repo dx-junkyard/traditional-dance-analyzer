@@ -22,14 +22,18 @@ class DanceAnalyzer:
         Only maps critical landmarks for compatibility.
 
         YOLO Keypoints (COCO):
-        0: Nose, 5: L Shoulder, 6: R Shoulder,
+        0: Nose, 1: L Eye, 2: R Eye, 3: L Ear, 4: R Ear
+        5: L Shoulder, 6: R Shoulder, 7: L Elbow, 8: R Elbow
         9: L Wrist, 10: R Wrist,
-        11: L Hip, 12: R Hip
+        11: L Hip, 12: R Hip, 13: L Knee, 14: R Knee
+        15: L Ankle, 16: R Ankle
 
         MediaPipe Landmarks:
-        0: Nose, 11: L Shoulder, 12: R Shoulder,
+        0: Nose, 2: L Eye, 5: R Eye, 7: L Ear, 8: R Ear
+        11: L Shoulder, 12: R Shoulder, 13: L Elbow, 14: R Elbow
         15: L Wrist, 16: R Wrist,
-        23: L Hip, 24: R Hip
+        23: L Hip, 24: R Hip, 25: L Knee, 26: R Knee
+        27: L Ankle, 28: R Ankle
         """
         h, w = image_shape[:2]
         mp_landmarks = []
@@ -41,12 +45,22 @@ class DanceAnalyzer:
         # Mapping Dictionary: YOLO_Index -> MP_Index
         mapping = {
             0: 0,   # Nose
+            1: 2,   # Left Eye
+            2: 5,   # Right Eye
+            3: 7,   # Left Ear
+            4: 8,   # Right Ear
             5: 11,  # Left Shoulder
             6: 12,  # Right Shoulder
+            7: 13,  # Left Elbow
+            8: 14,  # Right Elbow
             9: 15,  # Left Wrist
             10: 16, # Right Wrist
             11: 23, # Left Hip
-            12: 24  # Right Hip
+            12: 24, # Right Hip
+            13: 25, # Left Knee
+            14: 26, # Right Knee
+            15: 27, # Left Ankle
+            16: 28  # Right Ankle
         }
 
         for yolo_idx, mp_idx in mapping.items():
@@ -192,6 +206,8 @@ class DanceAnalyzer:
                 current_frame_data = {
                     "frame": frames_processed,
                     "timestamp": frames_processed / fps if fps else 0,
+                    "people": [],
+                    # Legacy support for older metrics calculation (will point to target)
                     "landmarks": []
                 }
 
@@ -306,15 +322,29 @@ class DanceAnalyzer:
                                 target_track_id = best_recovery_id
                                 target_idx = current_track_indices[best_recovery_id]
 
-                    # 4. Extract Data for Target
-                    if target_idx != -1:
-                        # Extract keypoints
-                        kp = kpts_xyn[target_idx]
-                        cf = kpts_conf[target_idx]
+                    # 4. Extract Data for ALL people
+                    for i, tid in enumerate(track_ids):
+                         if cls_ids[i] != 0: continue
 
-                        # Map to MediaPipe format
-                        mp_landmarks = self._map_yolo_to_mp(kp, cf, (height, width))
-                        current_frame_data["landmarks"] = mp_landmarks
+                         # Extract keypoints
+                         kp = kpts_xyn[i]
+                         cf = kpts_conf[i]
+
+                         # Map to MediaPipe format
+                         mp_landmarks = self._map_yolo_to_mp(kp, cf, (height, width))
+
+                         is_target = (tid == target_track_id)
+
+                         person_data = {
+                             "id": tid,
+                             "is_target": is_target,
+                             "landmarks": mp_landmarks
+                         }
+                         current_frame_data["people"].append(person_data)
+
+                         # Populate legacy field if this is the target
+                         if is_target:
+                             current_frame_data["landmarks"] = mp_landmarks
 
                 pose_data.append(current_frame_data)
                 frames_processed += 1
@@ -378,11 +408,21 @@ class DanceAnalyzer:
         if not pose_data:
             return {}
 
+        # Helper to get target landmarks from frame
+        def get_target_landmarks(frame_data):
+            # Prefer new 'people' list
+            if "people" in frame_data:
+                for p in frame_data["people"]:
+                    if p.get("is_target"):
+                        return p["landmarks"]
+            # Fallback to legacy
+            return frame_data.get("landmarks", [])
+
         # 1. Koshi (MidHip Stability)
         # MidHip is roughly average of Left Hip (23) and Right Hip (24)
         mid_hip_y_variances = []
         for frame in pose_data:
-            landmarks = frame.get("landmarks", [])
+            landmarks = get_target_landmarks(frame)
             # Check for non-empty landmarks (YOLO might miss target in some frames)
             # Check if index 23/24 exist and are not zero (or handle zero)
             if len(landmarks) > 24:
@@ -403,8 +443,9 @@ class DanceAnalyzer:
         # Calculate jerk for hands (15, 16)
         hand_velocities = []
         for i in range(1, len(pose_data)):
-            curr = pose_data[i]["landmarks"]
-            prev = pose_data[i-1]["landmarks"]
+            curr = get_target_landmarks(pose_data[i])
+            prev = get_target_landmarks(pose_data[i-1])
+
             if not curr or not prev or len(curr) <= 16 or len(prev) <= 16:
                 continue
 
