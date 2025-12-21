@@ -351,29 +351,29 @@ class TrackerManager:
 
         # TARGET LOST -> Recovery or Sit-Tight
 
-            # A. Try Recovery First (Switch to better candidate)
-            # If a new ID appears that looks like the target, we prefer switching to it
-            # rather than assuming the target is "invisible" (Sit-Tight).
-            best_id = self._find_recovery_candidate(current_ids)
-            if best_id is not None:
-                logger.info(f"Recovered target: Switched from {self.target_id} to {best_id}")
-                self.target_id = best_id
-                self._update_target_state(detections)
-                return self.target_id, False
+        # A. Try Recovery First (Switch to better candidate)
+        # If a new ID appears that looks like the target, we prefer switching to it
+        # rather than assuming the target is "invisible" (Sit-Tight).
+        best_id = self._find_recovery_candidate(current_ids)
+        if best_id is not None:
+            logger.info(f"Recovered target: Switched from {self.target_id} to {best_id}")
+            self.target_id = best_id
+            self._update_target_state(detections)
+            return self.target_id, False
 
-            # B. Sit-Tight Logic (If no good candidate found)
-            if self.target_last_bbox_pixel is not None:
-                # Check color at last position
-                current_patch_hist = FeatureExtractor.extract_hsv_histogram(frame, self.target_last_bbox_pixel)
-                similarity = FeatureExtractor.compare_histograms(current_patch_hist, self.target_last_hist)
+        # B. Sit-Tight Logic (If no good candidate found)
+        if self.target_last_bbox_pixel is not None:
+            # Check color at last position
+            current_patch_hist = FeatureExtractor.extract_hsv_histogram(frame, self.target_last_bbox_pixel)
+            similarity = FeatureExtractor.compare_histograms(current_patch_hist, self.target_last_hist)
 
-                # Threshold for "Same Color"
-                if similarity > 0.6:
-                    # Assume target is still there
-                    return self.target_id, True # True = Virtual Tracking
+            # Threshold for "Same Color"
+            if similarity > 0.6:
+                # Assume target is still there
+                return self.target_id, True # True = Virtual Tracking
 
-            # Truly Lost
-            return self.target_id, True
+        # Truly Lost
+        return self.target_id, True
 
     def _update_target_state(self, detections):
         # Find detection for target_id
