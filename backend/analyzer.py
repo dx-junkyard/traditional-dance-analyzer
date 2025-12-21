@@ -183,6 +183,8 @@ class DanceAnalyzer:
 
         # --- Tracking State ---
         target_track_id = None
+        excluded_ids = set() # IDs to exclude (accompanists, etc.)
+        last_target_pos = None # Last known target position (cx, cy)
 
         # Store history for recovery logic: {track_id: [list of (cx, cy) positions]}
         track_histories = {}
@@ -256,7 +258,18 @@ class DanceAnalyzer:
                             # Store initial signature (simple aspect ratio for now)
                             _, _, w_b, h_b = boxes_xywhn[best_idx]
                             target_signature = w_b / h_b if h_b > 0 else 0
+
+                            # Initial last position
+                            bx, by, _, _ = boxes_xywhn[best_idx]
+                            last_target_pos = (bx, by)
+
+                            # Blacklist other IDs present in this frame
+                            for tid in track_ids:
+                                if tid != target_track_id:
+                                    excluded_ids.add(tid)
+
                             logger.info(f"Locked on Track ID: {target_track_id}")
+                            logger.info(f"Excluded IDs (Accompanists): {excluded_ids}")
 
                     # 2. Update Histories (for all people)
                     current_track_indices = {}
@@ -279,48 +292,57 @@ class DanceAnalyzer:
 
                     if target_track_id in current_track_indices:
                         target_idx = current_track_indices[target_track_id]
+                        # Update last known position
+                        bx, by, _, _ = boxes_xywhn[target_idx]
+                        last_target_pos = (bx, by)
                     else:
                         # TARGET LOST - RECOVERY LOGIC
-                        # Prioritize: 1. Movement (Dynamics), 2. Skeleton/Shape Consistency
                         if target_track_id is not None:
                             best_recovery_score = -1
                             best_recovery_id = None
 
+                            logger.info(f"Target {target_track_id} lost. Attempting recovery...")
+
                             for tid, idx in current_track_indices.items():
-                                # Score 1: Movement Profile (Variance of position)
-                                # Dancer moves more than accompanist
+                                # CRITERIA 1: Not in Excluded List
+                                if tid in excluded_ids:
+                                    continue
+
+                                # CRITERIA 2: Proximity to last known position (60%)
+                                proximity_score = 0
+                                if last_target_pos:
+                                    lx, ly = last_target_pos
+                                    cx, cy, _, _ = boxes_xywhn[idx]
+                                    dist = np.sqrt((lx - cx)**2 + (ly - cy)**2)
+                                    # Normalize: distance > 0.5 (half screen) implies 0 score
+                                    proximity_score = max(0, 1.0 - dist * 2)
+
+                                # CRITERIA 3: Movement Intensity (40%)
+                                # Yasugi-bushi dancer moves more than static people
                                 hist = track_histories.get(tid, [])
                                 movement_score = 0
                                 if len(hist) > 5:
                                     hist_arr = np.array(hist)
-                                    # Calculate path length or variance
-                                    # Variance is good for "staying in place" vs "moving around"
-                                    # Velocity is good for "active"
+                                    # Calculate total path length (velocity)
                                     velocity = np.sum(np.sqrt(np.diff(hist_arr[:,0])**2 + np.diff(hist_arr[:,1])**2))
                                     movement_score = min(velocity * 10, 1.0) # Normalize loosely
 
-                                # Score 2: Shape Consistency
-                                _, _, w_b, h_b = boxes_xywhn[idx]
-                                current_ratio = w_b / h_b if h_b > 0 else 0
-                                shape_score = 0
-                                if target_signature:
-                                    diff = abs(current_ratio - target_signature)
-                                    shape_score = max(0, 1.0 - diff * 2)
-
                                 # Combined Score (Weighted)
-                                # Prompt says: Priority 1 is Movement.
-                                total_score = 0.7 * movement_score + 0.3 * shape_score
+                                # Distance (0.6) + Movement (0.4)
+                                total_score = 0.6 * proximity_score + 0.4 * movement_score
 
                                 if total_score > best_recovery_score:
                                     best_recovery_score = total_score
                                     best_recovery_id = tid
 
-                            # Threshold to accept switch?
-                            # If we found *someone*, and the previous one is gone, we switch.
-                            if best_recovery_id is not None:
+                            # Threshold to accept switch
+                            if best_recovery_id is not None and best_recovery_score > 0.3:
                                 logger.info(f"Target lost. Switching from {target_track_id} to {best_recovery_id} (Score: {best_recovery_score:.2f})")
                                 target_track_id = best_recovery_id
                                 target_idx = current_track_indices[best_recovery_id]
+                                # Update position
+                                bx, by, _, _ = boxes_xywhn[target_idx]
+                                last_target_pos = (bx, by)
 
                     # 4. Extract Data for ALL people
                     for i, tid in enumerate(track_ids):
