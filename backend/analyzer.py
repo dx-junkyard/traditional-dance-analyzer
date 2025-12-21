@@ -1,5 +1,4 @@
 import cv2
-import mediapipe as mp
 import numpy as np
 import librosa
 import json
@@ -7,445 +6,340 @@ import os
 import logging
 import time
 import base64
+from ultralytics import YOLO
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def extract_torso_roi(image, landmarks):
-    """
-    Extracts the torso ROI based on shoulder (11, 12) and hip (23, 24) landmarks.
-    Landmarks are normalized [0, 1] relative to the image dimensions.
-    """
-    h, w, _ = image.shape
-
-    # Get coordinates
-    pts = [
-        landmarks[11], # Left Shoulder
-        landmarks[12], # Right Shoulder
-        landmarks[23], # Left Hip
-        landmarks[24]  # Right Hip
-    ]
-
-    # Convert to pixel coords
-    pixel_pts = []
-    for pt in pts:
-        pixel_pts.append([int(pt.x * w), int(pt.y * h)])
-
-    pixel_pts = np.array(pixel_pts)
-
-    # Get bounding rect of these points
-    x, y, bw, bh = cv2.boundingRect(pixel_pts)
-
-    # Add slight padding
-    pad_x = int(bw * 0.1)
-    pad_y = int(bh * 0.1)
-
-    x = max(0, x - pad_x)
-    y = max(0, y - pad_y)
-    bw = min(w - x, bw + 2 * pad_x)
-    bh = min(h - y, bh + 2 * pad_y)
-
-    if bw <= 0 or bh <= 0:
-        return None
-
-    return image[y:y+bh, x:x+bw]
-
-def calculate_color_histogram(image):
-    """
-    Calculates normalized 2D HSV histogram (Hue and Saturation).
-    Input image is expected to be RGB.
-    """
-    # Convert RGB to HSV
-    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-    # 30 bins for Hue, 32 for Saturation
-    hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
-    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-    return hist
-
 class DanceAnalyzer:
     def __init__(self):
-        # We do not initialize Pose or Detector here to prevent state reuse / memory leaks.
-        # Each method creates its own instance.
-        self.mp_pose = mp.solutions.pose
+        # Use YOLOv8 Nano Pose for speed/accuracy balance
+        self.model_name = 'yolov8n-pose.pt'
 
-        # Helper for Detector options
-        self.BaseOptions = mp.tasks.BaseOptions
-        self.ObjectDetector = mp.tasks.vision.ObjectDetector
-        self.ObjectDetectorOptions = mp.tasks.vision.ObjectDetectorOptions
-        self.VisionRunningMode = mp.tasks.vision.RunningMode
+    def _map_yolo_to_mp(self, keypoints, confs, image_shape):
+        """
+        Maps YOLOv8 keypoints (17 points) to MediaPipe Pose structure (33 points).
+        Only maps critical landmarks for compatibility.
 
-        # Check for TFLite model
-        self.model_path = os.path.join(os.getcwd(), 'efficientdet_lite0.tflite')
+        YOLO Keypoints (COCO):
+        0: Nose, 5: L Shoulder, 6: R Shoulder,
+        9: L Wrist, 10: R Wrist,
+        11: L Hip, 12: R Hip
+
+        MediaPipe Landmarks:
+        0: Nose, 11: L Shoulder, 12: R Shoulder,
+        15: L Wrist, 16: R Wrist,
+        23: L Hip, 24: R Hip
+        """
+        h, w = image_shape[:2]
+        mp_landmarks = []
+
+        # Initialize 33 empty landmarks
+        for _ in range(33):
+            mp_landmarks.append({"x": 0, "y": 0, "z": 0, "visibility": 0})
+
+        # Mapping Dictionary: YOLO_Index -> MP_Index
+        mapping = {
+            0: 0,   # Nose
+            5: 11,  # Left Shoulder
+            6: 12,  # Right Shoulder
+            9: 15,  # Left Wrist
+            10: 16, # Right Wrist
+            11: 23, # Left Hip
+            12: 24  # Right Hip
+        }
+
+        for yolo_idx, mp_idx in mapping.items():
+            if yolo_idx < len(keypoints):
+                # YOLO coordinates are usually normalized if using .xyn,
+                # but we need to check if we are passing normalized or pixel.
+                # Here we assume we receive NORMALIZED coordinates (xyn).
+                kp = keypoints[yolo_idx]
+                conf = confs[yolo_idx] if confs is not None else 0.0
+
+                mp_landmarks[mp_idx] = {
+                    "x": float(kp[0]),
+                    "y": float(kp[1]),
+                    "z": 0.0, # 2D estimation only
+                    "visibility": float(conf)
+                }
+
+        return mp_landmarks
 
     def find_candidates(self, file_path: str):
         """
-        Scans the video for the first valid frame with people.
+        Scans the video for the first valid frame with people using YOLOv8.
         Returns the frame (base64) and a list of candidate bounding boxes.
-        Uses a local ObjectDetector instance to ensure no state leakage.
         """
-        # Create a local detector instance
-        options = self.ObjectDetectorOptions(
-            base_options=self.BaseOptions(model_asset_path=self.model_path),
-            running_mode=self.VisionRunningMode.IMAGE,
-            max_results=5,
-            score_threshold=0.3
-        )
-        detector = self.ObjectDetector.create_from_options(options)
-
+        model = YOLO(self.model_name)
         cap = cv2.VideoCapture(file_path)
         candidates = []
         frame_base64 = None
 
         try:
             frames_to_check = 30
-
             for _ in range(frames_to_check):
                 ret, frame = cap.read()
                 if not ret:
                     break
 
-                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image)
+                # YOLO inference
+                results = model(frame, verbose=False)
 
-                results = detector.detect(mp_image)
+                valid_detections = []
+                h, w, _ = frame.shape
 
-                if results.detections:
-                    h, w, _ = frame.shape
-                    valid_detections = []
-                    for i, detection in enumerate(results.detections):
-                        category = detection.categories[0]
-                        if category.category_name != 'person':
+                if results and len(results) > 0:
+                    result = results[0]
+                    # Check boxes
+                    for i, box in enumerate(result.boxes):
+                        cls = int(box.cls[0])
+                        if cls != 0: # 0 is person in COCO
                             continue
 
-                        bboxC = detection.bounding_box
+                        # xywhn returns normalized center_x, center_y, w, h
+                        # We need top_left_x, top_left_y, w, h for compatibility with frontend?
+                        # Re-reading `find_candidates` in original code:
+                        # Original used `bboxC.origin_x` etc. which is Top-Left.
+                        # YOLO `xywhn` is Center-based. `xyxyn` is Top-Left/Bottom-Right.
+                        # Let's use `xywhn` and convert or `xyxyn`.
+                        # Let's use box.xyxyn for normalized coords.
+
+                        b = box.xyxyn[0].cpu().numpy() # x1, y1, x2, y2 normalized
+                        x1, y1, x2, y2 = b
+                        width_n = x2 - x1
+                        height_n = y2 - y1
+
                         bbox = {
                             "id": i,
-                            "x": bboxC.origin_x / w,
-                            "y": bboxC.origin_y / h,
-                            "width": bboxC.width / w,
-                            "height": bboxC.height / h,
-                            "score": category.score
+                            "x": float(x1),
+                            "y": float(y1),
+                            "width": float(width_n),
+                            "height": float(height_n),
+                            "score": float(box.conf[0])
                         }
                         valid_detections.append(bbox)
 
-                    if valid_detections:
-                        candidates = valid_detections
-                        _, buffer = cv2.imencode('.jpg', frame)
-                        frame_base64 = base64.b64encode(buffer).decode('utf-8')
-                        break
+                if valid_detections:
+                    candidates = valid_detections
+                    _, buffer = cv2.imencode('.jpg', frame)
+                    frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                    break
+
         finally:
             cap.release()
-            detector.close() # Explicitly close detector
+            # No explicit close needed for YOLO object, but good practice to clear if possible
+            del model
 
         return {"image": frame_base64, "candidates": candidates}
 
     def analyze_video(self, file_path: str, tracking_config: dict = None):
         """
         Generator function that yields progress updates and finally the result.
-        Uses a local Pose instance with context manager to ensure clean state.
+        Uses YOLOv8-Pose with ByteTrack for multi-person tracking.
         """
         logger.info(f"Starting analysis for {file_path}")
         yield {"status": "starting", "progress": 0, "message": "Initializing analysis..."}
 
         start_time = time.time()
 
-        # Initialize Pose here with context manager
-        with self.mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=2,
-            enable_segmentation=True,
-            smooth_segmentation=False,
-            min_detection_confidence=0.5
-        ) as pose:
+        # Load Model
+        try:
+            model = YOLO(self.model_name)
+        except Exception as e:
+            logger.error(f"Failed to load YOLO model: {e}")
+            yield {"status": "error", "message": "Failed to load AI model"}
+            return
 
-            cap = cv2.VideoCapture(file_path)
-            if not cap.isOpened():
-                 yield {"status": "error", "progress": 0, "message": "Could not open video file"}
-                 return
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+             yield {"status": "error", "progress": 0, "message": "Could not open video file"}
+             return
 
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            pose_data = []
-            frames_processed = 0
+        pose_data = []
+        frames_processed = 0
 
-            logger.info(f"Video info: FPS={fps}, Frames={frame_count}")
-            yield {"status": "processing_video", "progress": 0, "message": f"Starting video processing ({frame_count} frames)..."}
+        logger.info(f"Video info: FPS={fps}, Frames={frame_count}")
+        yield {"status": "processing_video", "progress": 0, "message": f"Starting video processing ({frame_count} frames)..."}
 
-            # --- Tracking Initialization ---
-            target_hist = None
-            last_bbox = None # [x, y, w, h] normalized
+        # --- Tracking State ---
+        target_track_id = None
 
-            # Initialize Object Detector
-            options = self.ObjectDetectorOptions(
-                base_options=self.BaseOptions(model_asset_path=self.model_path),
-                running_mode=self.VisionRunningMode.IMAGE,
-                max_results=5,
-                score_threshold=0.3
-            )
-            detector = self.ObjectDetector.create_from_options(options)
+        # Store history for recovery logic: {track_id: [list of (cx, cy) positions]}
+        track_histories = {}
+        # Store skeletal signature: {track_id: ratio}
+        # Ratio = (LeftHip-RightHip dist) / (MidHip-MidShoulder dist) approx?
+        # Simpler: Just height/width of bounding box?
+        target_signature = None
 
-            try:
-                # 1. Initial Target Setup (if config provided)
-                if tracking_config and "target_bbox" in tracking_config:
-                    tb = tracking_config["target_bbox"]
-                    # Ensure list format [x, y, w, h]
-                    if isinstance(tb, dict):
-                        last_bbox = [tb['x'], tb['y'], tb['width'], tb['height']]
+        pose_start = time.time()
+
+        try:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # Run YOLO Tracking
+                # persist=True is crucial for ID consistency
+                results = model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
+
+                current_frame_data = {
+                    "frame": frames_processed,
+                    "timestamp": frames_processed / fps if fps else 0,
+                    "landmarks": []
+                }
+
+                if results and results[0].boxes and results[0].boxes.id is not None:
+                    boxes = results[0].boxes
+                    keypoints = results[0].keypoints
+
+                    # Convert tensors to numpy
+                    track_ids = boxes.id.int().cpu().numpy().tolist()
+                    cls_ids = boxes.cls.int().cpu().numpy().tolist()
+                    boxes_xywhn = boxes.xywhn.cpu().numpy() # Center x,y, w, h normalized
+
+                    # Normalized keypoints for mapping
+                    kpts_xyn = keypoints.xyn.cpu().numpy()
+                    kpts_conf = keypoints.conf.cpu().numpy()
+
+                    # 1. ID Selection (First Frame / Initialization)
+                    if target_track_id is None and tracking_config and "target_bbox" in tracking_config:
+                        tb = tracking_config["target_bbox"]
+                        # Target BBox Center
+                        if isinstance(tb, dict):
+                            tx = tb['x'] + tb['width'] / 2
+                            ty = tb['y'] + tb['height'] / 2
+                        else:
+                            # Assume list [x, y, w, h]
+                            tx = tb[0] + tb[2] / 2
+                            ty = tb[1] + tb[3] / 2
+
+                        best_dist = float('inf')
+                        best_id = -1
+                        best_idx = -1
+
+                        for i, tid in enumerate(track_ids):
+                            if cls_ids[i] != 0: continue # Only persons
+
+                            bx, by, bw, bh = boxes_xywhn[i]
+                            dist = np.sqrt((tx - bx)**2 + (ty - by)**2)
+
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_id = tid
+                                best_idx = i
+
+                        if best_id != -1:
+                            target_track_id = best_id
+                            # Store initial signature (simple aspect ratio for now)
+                            _, _, w_b, h_b = boxes_xywhn[best_idx]
+                            target_signature = w_b / h_b if h_b > 0 else 0
+                            logger.info(f"Locked on Track ID: {target_track_id}")
+
+                    # 2. Update Histories (for all people)
+                    current_track_indices = {}
+                    for i, tid in enumerate(track_ids):
+                        if cls_ids[i] != 0: continue
+
+                        if tid not in track_histories:
+                            track_histories[tid] = []
+
+                        cx, cy, _, _ = boxes_xywhn[i]
+                        track_histories[tid].append((cx, cy))
+                        # Keep history short (e.g., 30 frames)
+                        if len(track_histories[tid]) > 30:
+                            track_histories[tid].pop(0)
+
+                        current_track_indices[tid] = i
+
+                    # 3. Target Retrieval or Recovery
+                    target_idx = -1
+
+                    if target_track_id in current_track_indices:
+                        target_idx = current_track_indices[target_track_id]
                     else:
-                        last_bbox = tb
+                        # TARGET LOST - RECOVERY LOGIC
+                        # Prioritize: 1. Movement (Dynamics), 2. Skeleton/Shape Consistency
+                        if target_track_id is not None:
+                            best_recovery_score = -1
+                            best_recovery_id = None
 
-                    # Compute initial histogram from the first frame
-                    ret, first_frame = cap.read()
-                    if ret:
-                        # Convert to RGB for consistency
-                        first_frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+                            for tid, idx in current_track_indices.items():
+                                # Score 1: Movement Profile (Variance of position)
+                                # Dancer moves more than accompanist
+                                hist = track_histories.get(tid, [])
+                                movement_score = 0
+                                if len(hist) > 5:
+                                    hist_arr = np.array(hist)
+                                    # Calculate path length or variance
+                                    # Variance is good for "staying in place" vs "moving around"
+                                    # Velocity is good for "active"
+                                    velocity = np.sum(np.sqrt(np.diff(hist_arr[:,0])**2 + np.diff(hist_arr[:,1])**2))
+                                    movement_score = min(velocity * 10, 1.0) # Normalize loosely
 
-                        # Extract ROI for histogram from initial bbox
-                        lx, ly, lw, lh = last_bbox
-                        px = int(lx * width)
-                        py = int(ly * height)
-                        pw = int(lw * width)
-                        ph = int(lh * height)
+                                # Score 2: Shape Consistency
+                                _, _, w_b, h_b = boxes_xywhn[idx]
+                                current_ratio = w_b / h_b if h_b > 0 else 0
+                                shape_score = 0
+                                if target_signature:
+                                    diff = abs(current_ratio - target_signature)
+                                    shape_score = max(0, 1.0 - diff * 2)
 
-                        # Clamp
-                        px = max(0, px); py = max(0, py)
-                        pw = min(width - px, pw); ph = min(height - py, ph)
+                                # Combined Score (Weighted)
+                                # Prompt says: Priority 1 is Movement.
+                                total_score = 0.7 * movement_score + 0.3 * shape_score
 
-                        if pw > 0 and ph > 0:
-                            # Try to extract Torso for better color representation
-                            init_roi = first_frame_rgb[py:py+ph, px:px+pw]
+                                if total_score > best_recovery_score:
+                                    best_recovery_score = total_score
+                                    best_recovery_id = tid
 
-                            # Run Pose on this ROI to find torso
-                            # This might fail if the crop is too small or pose not visible, but worth a try
-                            init_results = pose.process(init_roi)
-                            if init_results.pose_landmarks:
-                                torso_roi = extract_torso_roi(init_roi, init_results.pose_landmarks.landmark)
-                                if torso_roi is not None:
-                                    target_hist = calculate_color_histogram(torso_roi)
+                            # Threshold to accept switch?
+                            # If we found *someone*, and the previous one is gone, we switch.
+                            if best_recovery_id is not None:
+                                logger.info(f"Target lost. Switching from {target_track_id} to {best_recovery_id} (Score: {best_recovery_score:.2f})")
+                                target_track_id = best_recovery_id
+                                target_idx = current_track_indices[best_recovery_id]
 
-                            # Fallback: use the whole bbox (or center) if torso extraction failed
-                            if target_hist is None:
-                                target_hist = calculate_color_histogram(init_roi)
+                    # 4. Extract Data for Target
+                    if target_idx != -1:
+                        # Extract keypoints
+                        kp = kpts_xyn[target_idx]
+                        cf = kpts_conf[target_idx]
 
-                        # Reset cap to frame 0 for processing loop
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    else:
-                        logger.warning("Could not read first frame for target initialization")
+                        # Map to MediaPipe format
+                        mp_landmarks = self._map_yolo_to_mp(kp, cf, (height, width))
+                        current_frame_data["landmarks"] = mp_landmarks
 
-                pose_start = time.time()
+                pose_data.append(current_frame_data)
+                frames_processed += 1
 
-                # Main Loop
-                while cap.isOpened():
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-
-                    # Convert to RGB
-                    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    h, w, _ = frame.shape
-
-                    # --- Tracking Logic ---
-                    # 1. Define Search Region (ROI)
-                    search_roi_img = image_rgb
-                    offset_x, offset_y = 0, 0
-                    is_full_scan = True
-
-                    if last_bbox:
-                        # Create a search ROI around last_bbox
-                        lx, ly, lw, lh = last_bbox
-                        cx, cy = lx + lw/2, ly + lh/2
-
-                        # Search window: 2x the previous box size to allow movement
-                        search_w = max(lw * 2.0, 0.3)
-                        search_h = max(lh * 2.0, 0.3)
-
-                        sx = cx - search_w / 2
-                        sy = cy - search_h / 2
-
-                        # Convert to pixels
-                        psx = int(sx * w)
-                        psy = int(sy * h)
-                        psw = int(search_w * w)
-                        psh = int(search_h * h)
-
-                        # Handle boundaries
-                        psx = max(0, psx); psy = max(0, psy)
-                        psw = min(w - psx, psw); psh = min(h - psy, psh)
-
-                        if psw > 0 and psh > 0:
-                            search_roi_img = image_rgb[psy:psy+psh, psx:psx+psw]
-                            offset_x = psx
-                            offset_y = psy
-                            is_full_scan = False
-
-                    # 2. Detect in Search Region
-                    # Ensure data is contiguous for mp.Image
-                    if not search_roi_img.flags['C_CONTIGUOUS']:
-                        search_roi_img = np.ascontiguousarray(search_roi_img)
-
-                    mp_search_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=search_roi_img)
-                    detection_result = detector.detect(mp_search_img)
-                    detections = detection_result.detections
-
-                    # Fallback to full scan if no detections in ROI
-                    if not detections and not is_full_scan:
-                        is_full_scan = True
-                        search_roi_img = image_rgb
-                        offset_x, offset_y = 0, 0
-
-                        if not search_roi_img.flags['C_CONTIGUOUS']:
-                            search_roi_img = np.ascontiguousarray(search_roi_img)
-
-                        mp_search_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=search_roi_img)
-                        detection_result = detector.detect(mp_search_img)
-                        detections = detection_result.detections
-
-                    # 3. Identify Best Candidate
-                    best_candidate = None
-                    best_score = -1.0
-
-                    if detections:
-                        for detection in detections:
-                            if detection.categories[0].category_name != 'person':
-                                continue
-
-                            bboxC = detection.bounding_box
-                            # Convert to global normalized coordinates
-                            gx = (bboxC.origin_x + offset_x) / w
-                            gy = (bboxC.origin_y + offset_y) / h
-                            gw = bboxC.width / w
-                            gh = bboxC.height / h
-
-                            candidate_bbox = [gx, gy, gw, gh]
-
-                            # Score 1: Spatial Consistency (Distance)
-                            score_dist = 0.0
-                            if last_bbox:
-                                lcx = last_bbox[0] + last_bbox[2]/2
-                                lcy = last_bbox[1] + last_bbox[3]/2
-                                ccx = gx + gw/2
-                                ccy = gy + gh/2
-                                dist = np.sqrt((lcx - ccx)**2 + (lcy - ccy)**2)
-                                score_dist = max(0, 1.0 - dist * 2)
-                            else:
-                                score_dist = 1.0 # No prior info
-
-                            # Score 2: Color Consistency
-                            score_color = 0.0
-                            if target_hist is not None:
-                                # Extract candidate ROI (global coords)
-                                px = int(gx * w)
-                                py = int(gy * h)
-                                pw = int(gw * w)
-                                ph = int(gh * h)
-
-                                px = max(0, px); py = max(0, py)
-                                pw = min(w - px, pw); ph = min(h - py, ph)
-
-                                if pw > 0 and ph > 0:
-                                    # Use central crop (50%) to approximate torso/reduce bg
-                                    cx_roi = px + pw//4
-                                    cy_roi = py + ph//4
-                                    cw_roi = pw // 2
-                                    ch_roi = ph // 2
-
-                                    if cw_roi > 0 and ch_roi > 0:
-                                        cand_roi = image_rgb[cy_roi:cy_roi+ch_roi, cx_roi:cx_roi+cw_roi]
-                                        cand_hist = calculate_color_histogram(cand_roi)
-                                        score_color = cv2.compareHist(target_hist, cand_hist, cv2.HISTCMP_CORREL)
-                                        score_color = max(0, score_color)
-                            else:
-                                score_color = 0.5
-
-                            # Weighted Score
-                            total_score = 0.6 * score_dist + 0.4 * score_color
-
-                            if total_score > best_score:
-                                best_score = total_score
-                                best_candidate = candidate_bbox
-
-                    # Update Tracker
-                    if best_candidate:
-                        last_bbox = best_candidate
-
-                    # --- Pose Analysis ---
-
-                    # Determine ROI for Pose (Focus on the tracked person)
-                    pose_roi_img = image_rgb
-                    pose_offset_x, pose_offset_y = 0, 0
-
-                    if last_bbox:
-                        lx, ly, lw, lh = last_bbox
-                        # Padding for Pose (20%)
-                        pad_w = lw * 0.2
-                        pad_h = lh * 0.2
-
-                        px = int((lx - pad_w) * w)
-                        py = int((ly - pad_h) * h)
-                        pw_ = int((lw + 2*pad_w) * w)
-                        ph_ = int((lh + 2*pad_h) * h)
-
-                        px = max(0, px); py = max(0, py)
-                        pw_ = min(w - px, pw_); ph_ = min(h - py, ph_)
-
-                        if pw_ > 0 and ph_ > 0:
-                            pose_roi_img = image_rgb[py:py+ph_, px:px+pw_]
-                            pose_offset_x = px
-                            pose_offset_y = py
-
-                    # Run Pose
-                    results = pose.process(pose_roi_img)
-
-                    frame_data = {
-                        "frame": frames_processed,
-                        "timestamp": frames_processed / fps if fps else 0,
-                        "landmarks": []
+                if frames_processed % 10 == 0 or frames_processed == frame_count:
+                    progress = (frames_processed / max(frame_count, 1)) * 0.7
+                    yield {
+                        "status": "processing_video",
+                        "progress": round(progress, 3),
+                        "message": f"Processing video frame {frames_processed}/{frame_count}"
                     }
 
-                    if results.pose_landmarks:
-                        for lm in results.pose_landmarks.landmark:
-                            # Convert back to global coordinates
-                            # lm is normalized [0,1] relative to pose_roi_img
-                            # Global pixel = lm * roi_dim + offset
-                            # Global norm = Global pixel / full_dim
+        finally:
+            cap.release()
+            del model
 
-                            global_x = (lm.x * pose_roi_img.shape[1] + pose_offset_x) / w
-                            global_y = (lm.y * pose_roi_img.shape[0] + pose_offset_y) / h
+        pose_end = time.time()
+        logger.info(f"Pose analysis took {pose_end - pose_start:.2f}s")
 
-                            frame_data["landmarks"].append({
-                                "x": global_x,
-                                "y": global_y,
-                                "z": lm.z,
-                                "visibility": lm.visibility
-                            })
-
-                    pose_data.append(frame_data)
-                    frames_processed += 1
-
-                    if frames_processed % 10 == 0 or frames_processed == frame_count:
-                        progress = (frames_processed / max(frame_count, 1)) * 0.7
-                        yield {
-                            "status": "processing_video",
-                            "progress": round(progress, 3),
-                            "message": f"Processing video frame {frames_processed}/{frame_count}"
-                        }
-            finally:
-                cap.release()
-                detector.close()
-
-            pose_end = time.time()
-            logger.info(f"Pose analysis took {pose_end - pose_start:.2f}s")
-
-        # 2. Audio Analysis with Librosa
+        # 2. Audio Analysis with Librosa (Unchanged)
         yield {"status": "processing_audio", "progress": 0.7, "message": "Analyzing audio..."}
         audio_start = time.time()
 
         audio_data = {}
         try:
-            # Librosa can be slow, especially loading
             y, sr = librosa.load(file_path)
             onset_env = librosa.onset.onset_strength(y=y, sr=sr)
             tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
@@ -453,7 +347,7 @@ class DanceAnalyzer:
 
             audio_data = {
                 "tempo": float(tempo),
-                "onset_env": onset_env.tolist()[::10], # Downsample for transmission
+                "onset_env": onset_env.tolist()[::10],
                 "duration": duration,
                 "sr": sr
             }
@@ -465,7 +359,7 @@ class DanceAnalyzer:
         logger.info(f"Audio analysis took {audio_end - audio_start:.2f}s")
         yield {"status": "processing_audio", "progress": 0.9, "message": "Audio analysis complete"}
 
-        # 3. Calculate Metrics
+        # 3. Calculate Metrics (Unchanged)
         yield {"status": "calculating_metrics", "progress": 0.95, "message": "Calculating metrics..."}
         metrics = self.calculate_metrics(pose_data, audio_data)
 
@@ -478,7 +372,6 @@ class DanceAnalyzer:
         total_time = time.time() - start_time
         logger.info(f"Total analysis took {total_time:.2f}s")
 
-        # Yield final result
         yield {"status": "complete", "progress": 1.0, "message": "Analysis complete", "result": final_result}
 
     def calculate_metrics(self, pose_data, audio_data):
@@ -490,26 +383,35 @@ class DanceAnalyzer:
         mid_hip_y_variances = []
         for frame in pose_data:
             landmarks = frame.get("landmarks", [])
+            # Check for non-empty landmarks (YOLO might miss target in some frames)
+            # Check if index 23/24 exist and are not zero (or handle zero)
             if len(landmarks) > 24:
                 left_hip = landmarks[23]
                 right_hip = landmarks[24]
-                mid_hip_y = (left_hip['y'] + right_hip['y']) / 2
-                mid_hip_y_variances.append(mid_hip_y)
+
+                # Check visibility/confidence > 0 to ensure valid detection
+                if left_hip['visibility'] > 0.3 and right_hip['visibility'] > 0.3:
+                    mid_hip_y = (left_hip['y'] + right_hip['y']) / 2
+                    mid_hip_y_variances.append(mid_hip_y)
 
         stability_score = 0.0
         if mid_hip_y_variances:
-            # Lower variance means higher stability. Normalize.
             variance = np.var(mid_hip_y_variances)
-            stability_score = max(0, 1.0 - (variance * 10)) # Heuristic scaling
+            stability_score = max(0, 1.0 - (variance * 10))
 
         # 2. Kire (Jerk of Hands)
-        # Calculate jerk (derivative of acceleration) for hands (15, 16)
+        # Calculate jerk for hands (15, 16)
         hand_velocities = []
-        # Simplified: average movement of wrists per frame
         for i in range(1, len(pose_data)):
             curr = pose_data[i]["landmarks"]
             prev = pose_data[i-1]["landmarks"]
-            if len(curr) > 16 and len(prev) > 16:
+            if not curr or not prev or len(curr) <= 16 or len(prev) <= 16:
+                continue
+
+            # Check visibility
+            if (curr[15]['visibility'] > 0.3 and prev[15]['visibility'] > 0.3 and
+                curr[16]['visibility'] > 0.3 and prev[16]['visibility'] > 0.3):
+
                 # Left wrist (15) dist
                 d_left = np.sqrt((curr[15]['x']-prev[15]['x'])**2 + (curr[15]['y']-prev[15]['y'])**2)
                 # Right wrist (16) dist
@@ -518,23 +420,17 @@ class DanceAnalyzer:
 
         dynamism_score = 0.0
         if hand_velocities:
-            # Kire implies ability to stop quickly (high deceleration) or move fast
-            # We use max velocity / average velocity as a proxy for "dynamic range" of movement
             avg_vel = np.mean(hand_velocities)
             max_vel = np.max(hand_velocities)
             if avg_vel > 0:
-                dynamism_score = min(1.0, (max_vel / avg_vel) / 5.0) # Heuristic
+                dynamism_score = min(1.0, (max_vel / avg_vel) / 5.0)
 
         # 3. Ma (Rhythm Harmony / Pause)
-        # Check if stops in movement correlate with audio onsets
-        rhythm_score = 0.5 # Default
-
-        # Simple heuristic: "Ma" score based on ratio of low-movement frames (pauses)
+        rhythm_score = 0.5
         if hand_velocities:
             threshold = np.mean(hand_velocities) * 0.2
             pause_frames = sum(1 for v in hand_velocities if v < threshold)
             pause_ratio = pause_frames / len(hand_velocities)
-            # Ideal "Ma" might be around 10-20% pause?
             rhythm_score = 1.0 - abs(pause_ratio - 0.15) * 2
             rhythm_score = max(0, min(1.0, rhythm_score))
 
