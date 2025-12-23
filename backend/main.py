@@ -104,8 +104,10 @@ async def analyze_stream(request: AnalyzeRequest):
                 if update.get("status") == "complete" and "result" in update:
                     try:
                         db = SessionLocal()
-                        save_analysis_result(db, video_id, update["result"])
-                        db.close()
+                        try:
+                            save_analysis_result(db, video_id, update["result"])
+                        finally:
+                            db.close()
                     except Exception as db_e:
                         print(f"Failed to save analysis result: {db_e}")
                         # We don't stop the stream, just log error (or send to client)
