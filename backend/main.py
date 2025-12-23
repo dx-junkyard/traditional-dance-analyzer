@@ -1,6 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Body
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, Body, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy.orm import Session
 import asyncio
 import json
 import tempfile
@@ -10,6 +11,10 @@ import uuid
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
 from analyzer import DanceAnalyzer
+from database import save_analysis_result, SessionLocal, create_tables, get_db, DanceAnalysis
+
+# Create tables on startup (simple approach for this task)
+create_tables()
 
 app = FastAPI(title="Traditional Dance Analyzer API")
 
@@ -95,6 +100,18 @@ async def analyze_stream(request: AnalyzeRequest):
         try:
             # analyzer.analyze_video is a generator.
             for update in analyzer.analyze_video(temp_path, tracking_config=tracking_config):
+                # Check for completion to save data
+                if update.get("status") == "complete" and "result" in update:
+                    try:
+                        db = SessionLocal()
+                        try:
+                            save_analysis_result(db, video_id, update["result"])
+                        finally:
+                            db.close()
+                    except Exception as db_e:
+                        print(f"Failed to save analysis result: {db_e}")
+                        # We don't stop the stream, just log error (or send to client)
+
                 yield json.dumps(update) + "\n"
         except Exception as e:
             yield json.dumps({"status": "error", "message": str(e)}) + "\n"
@@ -110,6 +127,32 @@ async def analyze_stream(request: AnalyzeRequest):
                     pass
 
     return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
+
+@app.get("/api/v1/results/{video_id}")
+def get_analysis_result(video_id: str, db: Session = Depends(get_db)):
+    """
+    Retrieve a saved analysis result by video_id.
+    """
+    result = db.query(DanceAnalysis).filter(DanceAnalysis.video_id == video_id).first()
+    if not result:
+        raise HTTPException(status_code=404, detail="Analysis result not found")
+
+    return {
+        "id": result.id,
+        "video_id": result.video_id,
+        "created_at": result.created_at,
+        "metrics": {
+            "stability_score": result.stability_score,
+            "rhythm_score": result.rhythm_score,
+            "dynamism_score": result.dynamism_score
+        },
+        "audio_summary": {
+            "tempo": result.tempo,
+            "duration": result.duration
+        },
+        "pose_data": result.pose_data,
+        "audio_data": result.audio_data
+    }
 
 @app.post("/api/v1/users/login")
 async def login_user(code: str):
